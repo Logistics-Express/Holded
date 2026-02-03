@@ -299,6 +299,30 @@ async def list_estimates(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/documents/{doc_type}/year/{year}")
+async def list_documents_by_year(
+    doc_type: str,
+    year: int,
+    limit: int = Query(500, le=1000),
+    client: HoldedClient = Depends(get_client)
+):
+    """List all documents of a type for a specific year."""
+    try:
+        date_from = int(datetime(year, 1, 1).timestamp())
+        date_to = int(datetime(year, 12, 31, 23, 59, 59).timestamp())
+
+        docs = client.list_documents_filtered(
+            doc_type=doc_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit
+        )
+        return {"documents": docs, "count": len(docs), "year": year}
+    except Exception as e:
+        logger.error(f"Error listing documents by year: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/documents/{doc_type}/{document_id}")
 async def get_document(
     doc_type: str,
@@ -611,30 +635,6 @@ async def get_invoice_by_number(
         invoice_number: str
 
     return await lookup_invoice(Req(invoice_number=invoice_number), year, client)
-
-
-@app.get("/api/v1/documents/{doc_type}/year/{year}")
-async def list_documents_by_year(
-    doc_type: str,
-    year: int,
-    limit: int = Query(500, le=1000),
-    client: HoldedClient = Depends(get_client)
-):
-    """List all documents of a type for a specific year."""
-    try:
-        date_from = int(datetime(year, 1, 1).timestamp())
-        date_to = int(datetime(year, 12, 31, 23, 59, 59).timestamp())
-
-        docs = client.list_documents_filtered(
-            doc_type=doc_type,
-            date_from=date_from,
-            date_to=date_to,
-            limit=limit
-        )
-        return {"documents": docs, "count": len(docs), "year": year}
-    except Exception as e:
-        logger.error(f"Error listing documents by year: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
