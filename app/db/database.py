@@ -4,6 +4,7 @@ Async database connection management with SQLAlchemy.
 
 import logging
 from typing import Optional
+from contextlib import asynccontextmanager
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -60,6 +61,23 @@ class DatabaseManager:
         if not self._session_factory:
             raise RuntimeError("Database not connected")
         return self._session_factory()
+
+    @asynccontextmanager
+    async def session(self):
+        """Async context manager for database sessions.
+
+        Usage:
+            async with db_manager.session() as session:
+                result = await session.execute(query)
+                await session.commit()
+        """
+        if not self._session_factory:
+            raise RuntimeError("Database not connected")
+        session = self._session_factory()
+        try:
+            yield session
+        finally:
+            await session.close()
 
     async def health_check(self) -> dict:
         """Check database health."""
