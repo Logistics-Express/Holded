@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -244,18 +245,25 @@ async def create_contact(
 async def list_invoices(
     limit: int = Query(50, le=500),
     contact_id: Optional[str] = None,
+    year: Optional[int] = Query(None, description="Filter by year (e.g., 2024)"),
+    date_from: Optional[int] = Query(None, description="Unix timestamp start"),
+    date_to: Optional[int] = Query(None, description="Unix timestamp end"),
     client: HoldedClient = Depends(get_client)
 ):
-    """List invoices."""
+    """List invoices with optional year/date filtering."""
     try:
-        if contact_id:
-            invoices = client.list_documents_filtered(
-                doc_type="invoice",
-                contact_id=contact_id,
-                limit=limit
-            )
-        else:
-            invoices = client.list_documents(doc_type="invoice", limit=limit)
+        # Convert year to date range if provided
+        if year and not date_from and not date_to:
+            date_from = int(datetime(year, 1, 1).timestamp())
+            date_to = int(datetime(year, 12, 31, 23, 59, 59).timestamp())
+
+        invoices = client.list_documents_filtered(
+            doc_type="invoice",
+            contact_id=contact_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit
+        )
         return {"invoices": invoices, "count": len(invoices)}
     except Exception as e:
         logger.error(f"Error listing invoices: {e}")
@@ -266,18 +274,25 @@ async def list_invoices(
 async def list_estimates(
     limit: int = Query(50, le=500),
     contact_id: Optional[str] = None,
+    year: Optional[int] = Query(None, description="Filter by year (e.g., 2024)"),
+    date_from: Optional[int] = Query(None, description="Unix timestamp start"),
+    date_to: Optional[int] = Query(None, description="Unix timestamp end"),
     client: HoldedClient = Depends(get_client)
 ):
-    """List estimates/quotations."""
+    """List estimates/quotations with optional year/date filtering."""
     try:
-        if contact_id:
-            estimates = client.list_documents_filtered(
-                doc_type="estimate",
-                contact_id=contact_id,
-                limit=limit
-            )
-        else:
-            estimates = client.list_documents(doc_type="estimate", limit=limit)
+        # Convert year to date range if provided
+        if year and not date_from and not date_to:
+            date_from = int(datetime(year, 1, 1).timestamp())
+            date_to = int(datetime(year, 12, 31, 23, 59, 59).timestamp())
+
+        estimates = client.list_documents_filtered(
+            doc_type="estimate",
+            contact_id=contact_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit
+        )
         return {"estimates": estimates, "count": len(estimates)}
     except Exception as e:
         logger.error(f"Error listing estimates: {e}")
@@ -524,9 +539,10 @@ async def check_outstanding_debt(
 @app.post("/api/v1/invoices/lookup")
 async def lookup_invoice(
     data: InvoiceLookupRequest,
+    year: Optional[int] = Query(None, description="Limit search to specific year"),
     client: HoldedClient = Depends(get_client)
 ):
-    """Look up invoice by number."""
+    """Look up invoice by number with optional year filter."""
     try:
         # Normalize invoice number
         invoice_number = data.invoice_number.upper().strip()
@@ -536,8 +552,19 @@ async def lookup_invoice(
             if invoice_number.startswith(prefix):
                 invoice_number = invoice_number[len(prefix):]
 
+        # Build date filter
+        date_from = date_to = None
+        if year:
+            date_from = int(datetime(year, 1, 1).timestamp())
+            date_to = int(datetime(year, 12, 31, 23, 59, 59).timestamp())
+
         # Search invoices
-        invoices = client.list_documents(doc_type="invoice", limit=500)
+        invoices = client.list_documents_filtered(
+            doc_type="invoice",
+            date_from=date_from,
+            date_to=date_to,
+            limit=500
+        )
 
         for inv in invoices:
             doc_number = inv.get("docNumber", "").upper()
@@ -574,15 +601,40 @@ async def lookup_invoice(
 @app.get("/api/v1/invoices/{invoice_number}")
 async def get_invoice_by_number(
     invoice_number: str,
+    year: Optional[int] = Query(None, description="Limit search to specific year"),
     client: HoldedClient = Depends(get_client)
 ):
-    """Get invoice by number (convenience endpoint)."""
+    """Get invoice by number (convenience endpoint) with optional year filter."""
     from pydantic import BaseModel as BM
 
     class Req(BM):
         invoice_number: str
 
-    return await lookup_invoice(Req(invoice_number=invoice_number), client)
+    return await lookup_invoice(Req(invoice_number=invoice_number), year, client)
+
+
+@app.get("/api/v1/documents/{doc_type}/year/{year}")
+async def list_documents_by_year(
+    doc_type: str,
+    year: int,
+    limit: int = Query(500, le=1000),
+    client: HoldedClient = Depends(get_client)
+):
+    """List all documents of a type for a specific year."""
+    try:
+        date_from = int(datetime(year, 1, 1).timestamp())
+        date_to = int(datetime(year, 12, 31, 23, 59, 59).timestamp())
+
+        docs = client.list_documents_filtered(
+            doc_type=doc_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit
+        )
+        return {"documents": docs, "count": len(docs), "year": year}
+    except Exception as e:
+        logger.error(f"Error listing documents by year: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
