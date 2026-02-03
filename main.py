@@ -12,20 +12,27 @@ Endpoints:
 - /api/v1/treasuries - Bank accounts
 - /api/v1/accounting - Trial balance, ledger, journal entries
 - /api/v1/debt - Debt/outstanding invoice checking
+- /api/v1/contable/agent - Contable AI Agent (autonomous accounting)
 """
 
 import os
 import sys
 import logging
+import json
+import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any
-from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, date
+from decimal import Decimal
+from collections import defaultdict
 import time
+import asyncio
 
-from fastapi import FastAPI, HTTPException, Query, Depends, Request
+from fastapi import FastAPI, HTTPException, Query, Depends, Request, Header, Security
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 # Add lib directory to path for HoldedClient
@@ -58,6 +65,31 @@ from app.cache.redis_client import RedisClient, set_redis_client, get_redis_clie
 from app.cache.decorators import cached, invalidate_cache
 from app.db.database import DatabaseManager, set_db_manager, get_db_manager
 from app.middleware.audit import AuditMiddleware
+from app.db.models import (
+    Base,
+    ContableActionQueue,
+    ContableReconciliationMatch,
+    ContableDailySnapshot,
+)
+from app.qonto.client import QontoClient, QontoTransaction
+
+# OpenAI for Contable AI Agent
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    OpenAI = None
+
+# APScheduler for background jobs
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    SCHEDULER_AVAILABLE = True
+except ImportError:
+    SCHEDULER_AVAILABLE = False
+    AsyncIOScheduler = None
+    CronTrigger = None
 
 # Configure logging
 logging.basicConfig(
@@ -66,8 +98,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger("holded-api")
 
-# Global client instance
+# Global client instances
 _client: Optional[HoldedClient] = None
+_openai_client: Optional["OpenAI"] = None
+_qonto_client: Optional[QontoClient] = None
+_scheduler: Optional["AsyncIOScheduler"] = None
+
+# Rate limiting state (in-memory, per-service)
+_rate_limit_state: Dict[str, List[float]] = defaultdict(list)
+
+
+def get_qonto_client() -> Optional[QontoClient]:
+    """Get or create QontoClient instance."""
+    global _qonto_client
+    if _qonto_client is None:
+        settings = get_settings()
+        if settings.qonto_secret_key:
+            _qonto_client = QontoClient(
+                login=settings.qonto_login,
+                secret_key=settings.qonto_secret_key,
+                iban=settings.qonto_iban,
+            )
+        else:
+            # Try to load from credentials file
+            try:
+                _qonto_client = QontoClient.from_credentials_file()
+            except Exception as e:
+                logger.warning(f"Could not load Qonto credentials: {e}")
+    return _qonto_client
+
+
+def get_openai_client() -> Optional["OpenAI"]:
+    """Get or create OpenAI client instance."""
+    global _openai_client
+    if _openai_client is None and OPENAI_AVAILABLE:
+        settings = get_settings()
+        if settings.openai_api_key:
+            _openai_client = OpenAI(api_key=settings.openai_api_key)
+    return _openai_client
 
 
 def get_client() -> HoldedClient:
@@ -86,9 +154,721 @@ def get_client() -> HoldedClient:
     return _client
 
 
+# ============================================================================
+# SERVICE AUTHENTICATION & RATE LIMITING
+# ============================================================================
+
+# API key header for service-to-service auth
+service_api_key_header = APIKeyHeader(name="X-Service-API-Key", auto_error=False)
+service_name_header = APIKeyHeader(name="X-Service-Name", auto_error=False)
+
+
+def check_rate_limit(service_name: str) -> bool:
+    """Check if service is within rate limit. Returns True if allowed."""
+    settings = get_settings()
+    limit = settings.service_rate_limits.get(service_name, settings.rate_limit_default)
+
+    now = time.time()
+    window_start = now - 60  # 1 minute window
+
+    # Clean old entries
+    _rate_limit_state[service_name] = [
+        t for t in _rate_limit_state[service_name] if t > window_start
+    ]
+
+    # Check limit
+    if len(_rate_limit_state[service_name]) >= limit:
+        return False
+
+    # Record this request
+    _rate_limit_state[service_name].append(now)
+    return True
+
+
+async def verify_service_auth(
+    api_key: Optional[str] = Security(service_api_key_header),
+    service_name: Optional[str] = Security(service_name_header),
+) -> Tuple[str, str]:
+    """Verify service API key and return (service_name, api_key).
+
+    Raises HTTPException if auth fails or rate limit exceeded.
+    """
+    settings = get_settings()
+
+    if not api_key or not service_name:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing X-Service-API-Key or X-Service-Name header"
+        )
+
+    # Check if service is known
+    expected_key = settings.service_api_keys.get(service_name)
+    if not expected_key:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Unknown service: {service_name}"
+        )
+
+    # Verify API key
+    if api_key != expected_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+    # Check rate limit
+    if not check_rate_limit(service_name):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded for service {service_name}"
+        )
+
+    return service_name, api_key
+
+
+# ============================================================================
+# CONTABLE AI AGENT - OPENAI INTEGRATION
+# ============================================================================
+
+CONTABLE_SYSTEM_PROMPT = """Eres el Agente Contable de Logistics Express, un sistema de IA especializado
+en contabilidad y finanzas españolas. Tu empresa es LOGISTICS EXPRESS ADUANAS, S.L.U. (NIF: B44995355).
+
+REGLAS DE SEGURIDAD:
+1. NUNCA ejecutes acciones por más de 500 EUR sin aprobación humana
+2. NUNCA modifiques asientos contables ya cerrados
+3. SIEMPRE genera borrador antes de ejecutar acciones irreversibles
+4. Para proveedores nuevos, SIEMPRE requiere aprobación
+
+CLASIFICACIÓN PGC (Plan General Contable español):
+- 6200: Arrendamientos y cánones (alquiler, renting, leasing)
+- 6210: Reparaciones y conservación (taller, mantenimiento)
+- 6220: Servicios profesionales (abogado, asesor, consultor)
+- 6230: Transportes (flete, envío, logística)
+- 6240: Primas de seguros
+- 6250: Servicios bancarios
+- 6260: Publicidad y propaganda
+- 6270: Suministros (luz, agua, teléfono, internet)
+- 6280: Combustibles (gasolina, gasóleo, diesel)
+- 6290: Otros servicios
+- 6300: Impuesto sobre beneficios
+- 6310: Otros tributos (tasas, IAE, IBI)
+- 6400: Sueldos y salarios
+- 6420: Seguridad Social
+- 6620: Intereses de deudas
+- 6690: Otros gastos financieros
+
+NIVELES DE ESCALACIÓN PARA IMPAGOS:
+- Nivel 1 (0-30 días): Monitorear
+- Nivel 2 (31-60 días): Recordatorio cordial
+- Nivel 3 (61-90 días): Notificación formal (citar Ley 3/2004)
+- Nivel 4 (90+ días): Escalación legal
+
+INTENTS DISPONIBLES:
+- reconcile: Conciliar pago con factura
+- mark_paid: Marcar documento como pagado
+- classify_expense: Clasificar gasto a cuenta PGC
+- create_escalation: Crear borrador de escalación de impago
+- check_invoice: Consultar estado de factura
+
+Responde SIEMPRE en JSON con la estructura:
+{
+  "intent": "string",
+  "confidence": 0.0-1.0,
+  "action_data": {...},
+  "explanation": "string",
+  "risk_assessment": {
+    "level": "auto_execute|draft|reject",
+    "reason": "string"
+  }
+}
+"""
+
+CONTABLE_FUNCTION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "reconcile_payment",
+            "description": "Conciliar un pago bancario con una factura o presupuesto en Holded",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "payment_amount": {"type": "number", "description": "Importe del pago en EUR"},
+                    "payment_reference": {"type": "string", "description": "Referencia del pago (número de factura, etc.)"},
+                    "payment_date": {"type": "string", "description": "Fecha del pago (YYYY-MM-DD)"},
+                    "document_id": {"type": "string", "description": "ID del documento en Holded (si se conoce)"},
+                    "contact_name": {"type": "string", "description": "Nombre del cliente/proveedor"},
+                },
+                "required": ["payment_amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "classify_expense",
+            "description": "Clasificar un gasto a una cuenta del Plan General Contable español",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "Descripción del gasto"},
+                    "supplier_name": {"type": "string", "description": "Nombre del proveedor"},
+                    "amount": {"type": "number", "description": "Importe del gasto en EUR"},
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_escalation",
+            "description": "Crear borrador de escalación para factura impagada",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {"type": "string", "description": "ID de la factura en Holded"},
+                    "invoice_number": {"type": "string", "description": "Número de factura"},
+                    "days_overdue": {"type": "integer", "description": "Días de retraso"},
+                    "amount": {"type": "number", "description": "Importe de la factura"},
+                    "contact_name": {"type": "string", "description": "Nombre del cliente"},
+                },
+                "required": ["invoice_id", "days_overdue"],
+            },
+        },
+    },
+]
+
+
+def assess_risk(
+    action_type: str,
+    amount: Optional[float],
+    confidence: float,
+    is_new_supplier: bool = False,
+) -> Tuple[str, str]:
+    """Assess risk level for an action.
+
+    Returns: (risk_level, reason)
+    """
+    settings = get_settings()
+
+    # New supplier always requires draft
+    if is_new_supplier and settings.new_supplier_always_draft:
+        return "draft", "Proveedor nuevo - requiere revisión"
+
+    # Low confidence always rejected
+    if confidence < settings.draft_min_confidence:
+        return "reject", f"Confianza muy baja ({confidence:.0%})"
+
+    # High amount always requires draft
+    if amount and amount > settings.auto_execute_max_amount:
+        if amount > 5000:
+            return "reject", f"Importe muy alto (€{amount:,.2f}) - requiere aprobación manual"
+        return "draft", f"Importe superior a €{settings.auto_execute_max_amount} - requiere aprobación"
+
+    # Medium confidence requires draft
+    if confidence < settings.auto_execute_min_confidence:
+        return "draft", f"Confianza media ({confidence:.0%}) - requiere revisión"
+
+    # All checks passed - auto execute
+    return "auto_execute", "Importe bajo y alta confianza"
+
+
+async def process_with_openai(
+    intent: str,
+    parameters: Dict[str, Any],
+    source_service: str,
+) -> Dict[str, Any]:
+    """Process an intent using OpenAI GPT-4o.
+
+    Returns structured response with action data and risk assessment.
+    """
+    openai_client = get_openai_client()
+    settings = get_settings()
+
+    if not openai_client:
+        # Fallback to rule-based processing
+        return await process_rule_based(intent, parameters)
+
+    # Build user message
+    user_message = f"""
+Intent: {intent}
+Parámetros: {json.dumps(parameters, ensure_ascii=False)}
+Servicio origen: {source_service}
+
+Analiza esta solicitud y devuelve tu respuesta en JSON.
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": CONTABLE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            tools=CONTABLE_FUNCTION_TOOLS,
+            tool_choice="auto",
+            temperature=0.1,  # Low temperature for deterministic responses
+            max_tokens=1000,
+        )
+
+        # Extract response
+        message = response.choices[0].message
+
+        # Check if function was called
+        if message.tool_calls:
+            tool_call = message.tool_calls[0]
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+
+            # Determine confidence from model response
+            confidence = 0.85  # Default for function calls
+
+            # Get amount for risk assessment
+            amount = function_args.get("amount") or function_args.get("payment_amount")
+
+            # Assess risk
+            risk_level, risk_reason = assess_risk(
+                action_type=function_name,
+                amount=amount,
+                confidence=confidence,
+            )
+
+            return {
+                "intent": function_name,
+                "confidence": confidence,
+                "action_data": function_args,
+                "explanation": f"OpenAI seleccionó {function_name}",
+                "risk_assessment": {
+                    "level": risk_level,
+                    "reason": risk_reason,
+                },
+                "ai_model": settings.openai_model,
+            }
+
+        # No function call - parse text response
+        content = message.content or "{}"
+        try:
+            result = json.loads(content)
+            # Add risk assessment if not present
+            if "risk_assessment" not in result:
+                amount = result.get("action_data", {}).get("amount")
+                confidence = result.get("confidence", 0.5)
+                risk_level, risk_reason = assess_risk(
+                    action_type=result.get("intent", "unknown"),
+                    amount=amount,
+                    confidence=confidence,
+                )
+                result["risk_assessment"] = {"level": risk_level, "reason": risk_reason}
+            result["ai_model"] = settings.openai_model
+            return result
+        except json.JSONDecodeError:
+            return {
+                "intent": intent,
+                "confidence": 0.5,
+                "action_data": parameters,
+                "explanation": content,
+                "risk_assessment": {"level": "draft", "reason": "No se pudo parsear respuesta AI"},
+                "ai_model": settings.openai_model,
+            }
+
+    except Exception as e:
+        logger.error(f"OpenAI error: {e}")
+        # Fallback to rule-based
+        return await process_rule_based(intent, parameters)
+
+
+async def process_rule_based(
+    intent: str,
+    parameters: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fallback rule-based processing when OpenAI is unavailable."""
+
+    if intent == "classify_expense":
+        description = parameters.get("description", "")
+        supplier = parameters.get("supplier_name", "")
+        classification = classify_expense(description, supplier)
+
+        return {
+            "intent": "classify_expense",
+            "confidence": classification.confidence,
+            "action_data": {
+                "account_code": classification.account_code,
+                "account_name": classification.account_name,
+                "description": description,
+            },
+            "explanation": f"Clasificado como {classification.account_code} ({classification.account_name})",
+            "risk_assessment": {
+                "level": "auto_execute" if classification.confidence > 0.9 else "draft",
+                "reason": classification.method,
+            },
+        }
+
+    elif intent == "reconcile":
+        amount = parameters.get("payment_amount")
+        risk_level, risk_reason = assess_risk("reconcile", amount, 0.7)
+        return {
+            "intent": "reconcile",
+            "confidence": 0.7,
+            "action_data": parameters,
+            "explanation": "Conciliación pendiente de validación",
+            "risk_assessment": {"level": risk_level, "reason": risk_reason},
+        }
+
+    elif intent == "create_escalation":
+        days = parameters.get("days_overdue", 0)
+        level = 1 if days <= 30 else (2 if days <= 60 else (3 if days <= 90 else 4))
+        return {
+            "intent": "create_escalation",
+            "confidence": 0.95,
+            "action_data": {**parameters, "escalation_level": level},
+            "explanation": f"Nivel de escalación {level} para {days} días de retraso",
+            "risk_assessment": {"level": "draft", "reason": "Escalación siempre requiere aprobación"},
+        }
+
+    else:
+        return {
+            "intent": intent,
+            "confidence": 0.5,
+            "action_data": parameters,
+            "explanation": "Intent no reconocido - requiere revisión manual",
+            "risk_assessment": {"level": "reject", "reason": "Intent desconocido"},
+        }
+
+
+# ============================================================================
+# BACKGROUND JOB FUNCTIONS
+# ============================================================================
+
+async def run_daily_reconciliation():
+    """Background job: Daily Qonto-Holded reconciliation.
+
+    Runs at configured hour (default 8 AM Madrid time).
+    Fetches recent Qonto transactions and matches with pending Holded documents.
+    """
+    logger.info("Running daily reconciliation job...")
+    try:
+        # Get database manager
+        db_manager = get_db_manager()
+
+        # Get Holded client
+        holded_client = get_client()
+
+        # Get Qonto client
+        qonto_client = get_qonto_client()
+        if not qonto_client:
+            logger.warning("Qonto client not available - skipping reconciliation")
+            return
+
+        # Get pending invoices and estimates from Holded
+        pending_invoices = holded_client.list_documents("invoice", limit=500)
+        pending_estimates = holded_client.list_documents("estimate", limit=500)
+
+        pending_docs = []
+        for doc in pending_invoices + pending_estimates:
+            if not doc.get("paid"):
+                pending_docs.append({
+                    "id": doc.get("id"),
+                    "number": doc.get("docNumber", ""),
+                    "type": "invoice" if doc in pending_invoices else "estimate",
+                    "amount": float(doc.get("total", 0)),
+                    "contact_name": doc.get("contactName", ""),
+                    "contact_id": doc.get("contactId"),
+                })
+
+        logger.info(f"Reconciliation: Found {len(pending_docs)} pending documents")
+
+        # Get recent credits from Qonto (last 60 days)
+        credits = qonto_client.list_credits(days=60)
+        logger.info(f"Reconciliation: Found {len(credits)} Qonto credits")
+
+        # Match payments to documents
+        matches_found = 0
+        for transaction in credits:
+            # Skip small amounts (likely fees or returns)
+            if float(transaction.amount) < 10:
+                continue
+
+            # Try to find matching document
+            best_match = None
+            best_confidence = 0
+
+            for doc in pending_docs:
+                confidence = 0
+
+                # Exact amount match (within 2 cents tolerance)
+                amount_diff = abs(float(transaction.amount) - doc["amount"])
+                if amount_diff <= 0.02:
+                    confidence += 0.4
+
+                # Check for invoice/estimate number in transaction label or reference
+                doc_number = doc["number"].upper().replace("-", "").replace(" ", "")
+                label_normalized = (transaction.label or "").upper().replace("-", "").replace(" ", "")
+                ref_normalized = (transaction.reference or "").upper().replace("-", "").replace(" ", "")
+
+                if doc_number and doc_number in label_normalized:
+                    confidence += 0.4
+                elif doc_number and doc_number in ref_normalized:
+                    confidence += 0.35
+
+                # Check contact name similarity
+                if doc["contact_name"]:
+                    contact_lower = doc["contact_name"].lower()
+                    label_lower = (transaction.label or "").lower()
+                    # Simple substring match
+                    if contact_lower in label_lower or label_lower in contact_lower:
+                        confidence += 0.2
+
+                if confidence > best_confidence and confidence >= 0.5:
+                    best_confidence = confidence
+                    best_match = doc
+
+            # If we found a match, save it
+            if best_match and db_manager:
+                matches_found += 1
+                async with db_manager.session() as session:
+                    # Check if match already exists
+                    from sqlalchemy import select
+                    existing = await session.execute(
+                        select(ContableReconciliationMatch).where(
+                            ContableReconciliationMatch.qonto_transaction_id == transaction.transaction_id,
+                            ContableReconciliationMatch.holded_document_id == best_match["id"],
+                        )
+                    )
+                    if existing.scalar_one_or_none():
+                        continue  # Already matched
+
+                    # Determine match type
+                    amount_diff = abs(float(transaction.amount) - best_match["amount"])
+                    if amount_diff <= 0.02:
+                        match_type = "exact_amount"
+                    elif best_match["number"].upper() in (transaction.label or "").upper():
+                        match_type = "reference"
+                    else:
+                        match_type = "name_similarity"
+
+                    # Create match record
+                    match_record = ContableReconciliationMatch(
+                        qonto_transaction_id=transaction.transaction_id,
+                        qonto_amount=Decimal(str(round(float(transaction.amount), 2))),
+                        qonto_date=transaction.settled_at or transaction.emitted_at,
+                        qonto_reference=transaction.reference,
+                        qonto_counterparty=transaction.label,
+                        holded_document_id=best_match["id"],
+                        holded_document_type=best_match["type"],
+                        holded_document_number=best_match["number"],
+                        holded_amount=Decimal(str(round(best_match["amount"], 2))),
+                        holded_contact_name=best_match["contact_name"],
+                        match_confidence=Decimal(str(round(best_confidence, 2))),
+                        match_type=match_type,
+                        match_details={
+                            "amount_diff": round(amount_diff, 2),
+                            "transaction_label": transaction.label,
+                        },
+                        status="pending",
+                    )
+                    session.add(match_record)
+                    await session.commit()
+
+        logger.info(f"Reconciliation completed: {matches_found} new matches found")
+
+    except Exception as e:
+        logger.error(f"Reconciliation job error: {e}")
+
+
+async def run_daily_snapshot():
+    """Background job: Daily financial snapshot.
+
+    Runs at configured hour (default 11 PM Madrid time).
+    Captures end-of-day financial position for trend analysis.
+    """
+    logger.info("Running daily snapshot job...")
+    try:
+        db_manager = get_db_manager()
+        if not db_manager:
+            logger.warning("Database not available for snapshot job")
+            return
+
+        client = get_client()
+        now = int(datetime.now().timestamp())
+        today = date.today()
+
+        # Get all invoices
+        invoices = client.list_documents("invoice", limit=500)
+        purchases = client.list_documents("purchase", limit=500)
+
+        # Calculate receivables
+        total_receivables = 0
+        receivables_current = 0
+        receivables_30 = 0
+        receivables_60 = 0
+        receivables_90 = 0
+        receivables_90_plus = 0
+
+        for inv in invoices:
+            if inv.get("paid"):
+                continue
+            amount = float(inv.get("total", 0))
+            total_receivables += amount
+
+            due_date = inv.get("dueDate", now)
+            if due_date >= now:
+                receivables_current += amount
+            else:
+                days_overdue = (now - due_date) // 86400
+                if days_overdue <= 30:
+                    receivables_30 += amount
+                elif days_overdue <= 60:
+                    receivables_60 += amount
+                elif days_overdue <= 90:
+                    receivables_90 += amount
+                else:
+                    receivables_90_plus += amount
+
+        # Calculate payables
+        total_payables = 0
+        payables_current = 0
+        payables_overdue = 0
+
+        for pur in purchases:
+            if pur.get("paid"):
+                continue
+            amount = float(pur.get("total", 0))
+            total_payables += amount
+
+            due_date = pur.get("dueDate", now)
+            if due_date >= now:
+                payables_current += amount
+            else:
+                payables_overdue += amount
+
+        # Get bank balance from Qonto
+        bank_balance = None
+        qonto = get_qonto_client()
+        if qonto:
+            try:
+                balance_data = qonto.get_balance()
+                if "balance" in balance_data:
+                    bank_balance = float(balance_data["balance"])
+            except Exception as e:
+                logger.warning(f"Could not fetch Qonto balance: {e}")
+
+        # Create snapshot record
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            # Check if snapshot exists for today
+            result = await session.execute(
+                select(ContableDailySnapshot).where(
+                    ContableDailySnapshot.snapshot_date == today
+                )
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                # Update existing
+                existing.total_receivables = Decimal(str(round(total_receivables, 2)))
+                existing.receivables_current = Decimal(str(round(receivables_current, 2)))
+                existing.receivables_overdue_30 = Decimal(str(round(receivables_30, 2)))
+                existing.receivables_overdue_60 = Decimal(str(round(receivables_60, 2)))
+                existing.receivables_overdue_90 = Decimal(str(round(receivables_90, 2)))
+                existing.receivables_overdue_90_plus = Decimal(str(round(receivables_90_plus, 2)))
+                existing.total_payables = Decimal(str(round(total_payables, 2)))
+                existing.payables_current = Decimal(str(round(payables_current, 2)))
+                existing.payables_overdue = Decimal(str(round(payables_overdue, 2)))
+                if bank_balance is not None:
+                    existing.bank_balance = Decimal(str(round(bank_balance, 2)))
+            else:
+                # Create new
+                snapshot = ContableDailySnapshot(
+                    snapshot_date=today,
+                    total_receivables=Decimal(str(round(total_receivables, 2))),
+                    receivables_current=Decimal(str(round(receivables_current, 2))),
+                    receivables_overdue_30=Decimal(str(round(receivables_30, 2))),
+                    receivables_overdue_60=Decimal(str(round(receivables_60, 2))),
+                    receivables_overdue_90=Decimal(str(round(receivables_90, 2))),
+                    receivables_overdue_90_plus=Decimal(str(round(receivables_90_plus, 2))),
+                    total_payables=Decimal(str(round(total_payables, 2))),
+                    payables_current=Decimal(str(round(payables_current, 2))),
+                    payables_overdue=Decimal(str(round(payables_overdue, 2))),
+                    bank_balance=Decimal(str(round(bank_balance, 2))) if bank_balance else None,
+                )
+                session.add(snapshot)
+
+            await session.commit()
+
+        balance_str = f", bank={bank_balance:.2f}" if bank_balance else ""
+        logger.info(f"Snapshot created: receivables={total_receivables:.2f}, payables={total_payables:.2f}{balance_str}")
+
+    except Exception as e:
+        logger.error(f"Snapshot job error: {e}")
+
+
+async def run_anomaly_check():
+    """Background job: Daily anomaly detection.
+
+    Runs at configured hour (default 9 AM Madrid time).
+    Checks for duplicate invoices, unusual amounts, etc.
+    """
+    logger.info("Running daily anomaly check job...")
+    try:
+        client = get_client()
+        db_manager = get_db_manager()
+
+        # Get recent documents
+        invoices = client.list_documents("invoice", limit=500)
+        purchases = client.list_documents("purchase", limit=500)
+
+        anomalies_found = 0
+
+        # Check for duplicate invoice numbers
+        invoice_numbers = {}
+        for inv in invoices:
+            num = inv.get("docNumber", "")
+            if num in invoice_numbers:
+                anomalies_found += 1
+                logger.warning(f"Anomaly: Duplicate invoice number {num}")
+            else:
+                invoice_numbers[num] = inv.get("id")
+
+        # Check for same-day duplicate purchases
+        purchase_keys = {}
+        for pur in purchases:
+            supplier = pur.get("contactId", "")
+            amount = round(float(pur.get("total", 0)), 2)
+            pur_date = pur.get("date", 0)
+            key = f"{supplier}:{amount}:{pur_date}"
+
+            if key in purchase_keys and supplier:
+                anomalies_found += 1
+                logger.warning(f"Anomaly: Possible duplicate purchase for supplier {supplier}")
+            else:
+                purchase_keys[key] = pur.get("id")
+
+        # Update daily snapshot with anomaly count
+        if db_manager:
+            async with db_manager.session() as session:
+                from sqlalchemy import select
+                today = date.today()
+                result = await session.execute(
+                    select(ContableDailySnapshot).where(
+                        ContableDailySnapshot.snapshot_date == today
+                    )
+                )
+                snapshot = result.scalar_one_or_none()
+                if snapshot:
+                    snapshot.anomalies_detected = anomalies_found
+                    await session.commit()
+
+        logger.info(f"Anomaly check completed: {anomalies_found} anomalies found")
+
+    except Exception as e:
+        logger.error(f"Anomaly check job error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    global _scheduler
     settings = get_settings()
     logger.info("Holded API service starting...")
 
@@ -114,9 +894,58 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Database connection failed, audit disabled: {e}")
 
+    # Initialize Scheduler for Contable Agent background jobs
+    if settings.scheduler_enabled and SCHEDULER_AVAILABLE:
+        try:
+            _scheduler = AsyncIOScheduler()
+
+            # Daily reconciliation job (8 AM Madrid time)
+            _scheduler.add_job(
+                run_daily_reconciliation,
+                CronTrigger(hour=settings.reconciliation_job_hour, timezone="Europe/Madrid"),
+                id="daily_reconciliation",
+                name="Daily Qonto-Holded Reconciliation",
+                replace_existing=True,
+            )
+
+            # Daily snapshot job (11 PM Madrid time)
+            _scheduler.add_job(
+                run_daily_snapshot,
+                CronTrigger(hour=settings.snapshot_job_hour, timezone="Europe/Madrid"),
+                id="daily_snapshot",
+                name="Daily Financial Snapshot",
+                replace_existing=True,
+            )
+
+            # Daily anomaly check (9 AM Madrid time)
+            _scheduler.add_job(
+                run_anomaly_check,
+                CronTrigger(hour=settings.anomaly_check_job_hour, timezone="Europe/Madrid"),
+                id="daily_anomaly_check",
+                name="Daily Anomaly Detection",
+                replace_existing=True,
+            )
+
+            _scheduler.start()
+            logger.info("Background scheduler started with 3 daily jobs")
+        except Exception as e:
+            logger.warning(f"Scheduler initialization failed: {e}")
+            _scheduler = None
+
+    # Initialize OpenAI client
+    if settings.contable_agent_enabled and settings.openai_api_key:
+        openai_client = get_openai_client()
+        if openai_client:
+            logger.info(f"Contable AI Agent enabled (model: {settings.openai_model})")
+        else:
+            logger.warning("Contable AI Agent: OpenAI client not available")
+
     yield
 
     # Cleanup
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
+        logger.info("Background scheduler stopped")
     if redis_client:
         await redis_client.close()
     if db_manager:
@@ -362,6 +1191,72 @@ class Anomaly(BaseModel):
     document_number: str
     description: str
     details: Dict[str, Any] = {}
+
+
+# ============================================================================
+# CONTABLE AI AGENT MODELS
+# ============================================================================
+
+class AgentExecuteRequest(BaseModel):
+    """Request to execute an action via Contable AI Agent."""
+    intent: str = Field(..., description="Intent: reconcile, mark_paid, classify_expense, create_escalation, check_invoice")
+    parameters: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the intent")
+    force_draft: bool = Field(False, description="Force draft mode even for low-risk actions")
+
+
+class AgentExecuteResponse(BaseModel):
+    """Response from Contable AI Agent execution."""
+    action_id: str = Field(..., description="UUID of the action")
+    status: str = Field(..., description="auto_executed, draft_created, rejected")
+    risk_level: str = Field(..., description="auto_execute, draft, reject")
+    confidence: float = Field(..., description="AI confidence 0.0-1.0")
+    result: Optional[Dict[str, Any]] = Field(None, description="Result if auto-executed")
+    explanation: str = Field(..., description="AI explanation")
+
+
+class DraftAction(BaseModel):
+    """Draft action waiting for approval."""
+    id: str
+    action_type: str
+    action_data: Dict[str, Any]
+    risk_level: str
+    confidence: float
+    amount_eur: Optional[float]
+    ai_explanation: str
+    source_service: Optional[str]
+    created_at: str
+    status: str
+
+
+class DraftApproveRequest(BaseModel):
+    """Request to approve a draft action."""
+    reviewed_by: str = Field(..., description="Name/ID of reviewer")
+    notes: Optional[str] = Field(None, description="Review notes")
+
+
+class DraftRejectRequest(BaseModel):
+    """Request to reject a draft action."""
+    reviewed_by: str = Field(..., description="Name/ID of reviewer")
+    reason: str = Field(..., description="Reason for rejection")
+
+
+class AgentStatsResponse(BaseModel):
+    """Statistics for Contable AI Agent."""
+    total_actions: int
+    actions_by_status: Dict[str, int]
+    actions_by_type: Dict[str, int]
+    auto_executed_today: int
+    drafts_pending: int
+    avg_confidence: float
+    total_amount_processed: float
+
+
+class SchedulerStatusResponse(BaseModel):
+    """Status of background job scheduler."""
+    enabled: bool
+    running: bool
+    jobs: List[Dict[str, Any]]
+    next_runs: Dict[str, Optional[str]]
 
 
 # Spanish PGC expense account classification hints
@@ -2399,6 +3294,1015 @@ async def get_daily_summary(
         }
     except Exception as e:
         logger.error(f"Error getting daily summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# CONTABLE AI AGENT - AUTONOMOUS EXECUTION ENDPOINTS
+# ============================================================================
+
+@app.post("/api/v1/contable/agent/execute", response_model=AgentExecuteResponse)
+async def execute_agent_action(
+    data: AgentExecuteRequest,
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+    client: HoldedClient = Depends(get_client),
+):
+    """Execute an action via Contable AI Agent.
+
+    This is the main entry point for autonomous accounting operations.
+    Actions are processed through OpenAI GPT-4o for intelligent classification
+    and risk assessment.
+
+    Security: Requires X-Service-API-Key and X-Service-Name headers.
+    Rate limited per service.
+
+    Risk levels:
+    - auto_execute: Amount <€500 AND confidence >95% - executed immediately
+    - draft: Medium risk - creates draft for human approval
+    - reject: High risk or low confidence - rejected
+
+    Args:
+        intent: reconcile, mark_paid, classify_expense, create_escalation, check_invoice
+        parameters: Intent-specific parameters
+        force_draft: Force draft mode even for low-risk actions
+
+    Returns:
+        AgentExecuteResponse with action_id, status, and result (if auto-executed)
+    """
+    service_name, _ = service_auth
+    settings = get_settings()
+
+    if not settings.contable_agent_enabled:
+        raise HTTPException(status_code=503, detail="Contable AI Agent is disabled")
+
+    try:
+        # Process with AI
+        ai_result = await process_with_openai(
+            intent=data.intent,
+            parameters=data.parameters,
+            source_service=service_name,
+        )
+
+        # Extract values
+        risk_level = ai_result["risk_assessment"]["level"]
+        confidence = ai_result.get("confidence", 0.5)
+        action_data = ai_result.get("action_data", data.parameters)
+        amount = action_data.get("amount") or action_data.get("payment_amount")
+
+        # Force draft if requested
+        if data.force_draft and risk_level == "auto_execute":
+            risk_level = "draft"
+            ai_result["risk_assessment"]["reason"] = "Forzado a borrador por solicitud"
+
+        # Generate action ID
+        action_id = str(uuid.uuid4())
+
+        # Get database manager
+        db_manager = get_db_manager()
+
+        # Handle based on risk level
+        if risk_level == "auto_execute":
+            # Execute immediately
+            result = await _execute_action(
+                client=client,
+                action_type=ai_result.get("intent", data.intent),
+                action_data=action_data,
+            )
+
+            # Log to database if available
+            if db_manager:
+                async with db_manager.session() as session:
+                    action_record = ContableActionQueue(
+                        id=uuid.UUID(action_id),
+                        action_type=ai_result.get("intent", data.intent),
+                        action_data=action_data,
+                        intent=data.intent,
+                        risk_level=risk_level,
+                        confidence_score=Decimal(str(round(confidence, 2))),
+                        amount_eur=Decimal(str(round(amount, 2))) if amount else None,
+                        ai_explanation=ai_result.get("explanation"),
+                        ai_model=ai_result.get("ai_model"),
+                        status="executed",
+                        source_service=service_name,
+                        executed_at=datetime.utcnow(),
+                        execution_result=result,
+                    )
+                    session.add(action_record)
+                    await session.commit()
+
+            return AgentExecuteResponse(
+                action_id=action_id,
+                status="auto_executed",
+                risk_level=risk_level,
+                confidence=confidence,
+                result=result,
+                explanation=ai_result.get("explanation", ""),
+            )
+
+        elif risk_level == "draft":
+            # Create draft for approval
+            if db_manager:
+                async with db_manager.session() as session:
+                    action_record = ContableActionQueue(
+                        id=uuid.UUID(action_id),
+                        action_type=ai_result.get("intent", data.intent),
+                        action_data=action_data,
+                        intent=data.intent,
+                        risk_level=risk_level,
+                        confidence_score=Decimal(str(round(confidence, 2))),
+                        amount_eur=Decimal(str(round(amount, 2))) if amount else None,
+                        ai_explanation=ai_result.get("explanation"),
+                        ai_model=ai_result.get("ai_model"),
+                        status="pending",
+                        source_service=service_name,
+                    )
+                    session.add(action_record)
+                    await session.commit()
+
+            return AgentExecuteResponse(
+                action_id=action_id,
+                status="draft_created",
+                risk_level=risk_level,
+                confidence=confidence,
+                result=None,
+                explanation=ai_result.get("explanation", "") + f" - {ai_result['risk_assessment']['reason']}",
+            )
+
+        else:  # reject
+            # Log rejection
+            if db_manager:
+                async with db_manager.session() as session:
+                    action_record = ContableActionQueue(
+                        id=uuid.UUID(action_id),
+                        action_type=ai_result.get("intent", data.intent),
+                        action_data=action_data,
+                        intent=data.intent,
+                        risk_level=risk_level,
+                        confidence_score=Decimal(str(round(confidence, 2))),
+                        amount_eur=Decimal(str(round(amount, 2))) if amount else None,
+                        ai_explanation=ai_result.get("explanation"),
+                        ai_model=ai_result.get("ai_model"),
+                        status="rejected",
+                        source_service=service_name,
+                        review_notes=ai_result["risk_assessment"]["reason"],
+                    )
+                    session.add(action_record)
+                    await session.commit()
+
+            return AgentExecuteResponse(
+                action_id=action_id,
+                status="rejected",
+                risk_level=risk_level,
+                confidence=confidence,
+                result=None,
+                explanation=ai_result["risk_assessment"]["reason"],
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Agent execute error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _execute_action(
+    client: HoldedClient,
+    action_type: str,
+    action_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Execute an approved action.
+
+    This is called for auto-executed actions or when a draft is approved.
+    """
+    settings = get_settings()
+
+    if action_type == "classify_expense":
+        # Classification is informational - just return the classification
+        return {
+            "classified": True,
+            "account_code": action_data.get("account_code"),
+            "account_name": action_data.get("account_name"),
+        }
+
+    elif action_type == "reconcile_payment" or action_type == "reconcile":
+        # Mark document as paid
+        document_id = action_data.get("document_id")
+        amount = action_data.get("payment_amount") or action_data.get("amount")
+
+        if document_id and amount:
+            payment_data = {
+                "amount": amount,
+                "date": int(time.time()),
+                "bankId": settings.holded_treasury_id,
+            }
+            result = client.pay_document(document_id, payment_data, doc_type="invoice")
+            # Invalidate cache
+            await invalidate_cache("holded:docs:invoice:*")
+            return {"reconciled": True, "document_id": document_id, "result": result}
+        else:
+            return {"reconciled": False, "error": "Missing document_id or amount"}
+
+    elif action_type == "mark_paid":
+        document_id = action_data.get("document_id")
+        amount = action_data.get("amount")
+        doc_type = action_data.get("document_type", "invoice")
+
+        if document_id and amount:
+            payment_data = {
+                "amount": amount,
+                "date": int(time.time()),
+                "bankId": settings.holded_treasury_id,
+            }
+            result = client.pay_document(document_id, payment_data, doc_type=doc_type)
+            await invalidate_cache(f"holded:docs:{doc_type}:*")
+            return {"marked_paid": True, "document_id": document_id, "result": result}
+        else:
+            return {"marked_paid": False, "error": "Missing document_id or amount"}
+
+    elif action_type == "create_escalation":
+        # Escalation creates a draft response - doesn't auto-execute
+        return {
+            "escalation_created": True,
+            "invoice_id": action_data.get("invoice_id"),
+            "escalation_level": action_data.get("escalation_level"),
+            "note": "Escalación creada como borrador para revisión",
+        }
+
+    else:
+        return {"executed": False, "error": f"Unknown action type: {action_type}"}
+
+
+@app.get("/api/v1/contable/agent/drafts")
+async def list_draft_actions(
+    status: str = Query("pending", description="Filter by status: pending, approved, rejected, executed"),
+    limit: int = Query(50, le=200),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """List draft actions waiting for approval.
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            query = select(ContableActionQueue).where(
+                ContableActionQueue.status == status
+            ).order_by(
+                ContableActionQueue.created_at.desc()
+            ).limit(limit)
+
+            result = await session.execute(query)
+            actions = result.scalars().all()
+
+            return {
+                "drafts": [
+                    DraftAction(
+                        id=str(a.id),
+                        action_type=a.action_type,
+                        action_data=a.action_data,
+                        risk_level=a.risk_level,
+                        confidence=float(a.confidence_score) if a.confidence_score else 0,
+                        amount_eur=float(a.amount_eur) if a.amount_eur else None,
+                        ai_explanation=a.ai_explanation or "",
+                        source_service=a.source_service,
+                        created_at=a.created_at.isoformat(),
+                        status=a.status,
+                    ).model_dump()
+                    for a in actions
+                ],
+                "count": len(actions),
+                "status_filter": status,
+            }
+    except Exception as e:
+        logger.error(f"Error listing drafts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/contable/agent/drafts/{draft_id}/approve")
+async def approve_draft_action(
+    draft_id: str,
+    data: DraftApproveRequest,
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+    client: HoldedClient = Depends(get_client),
+):
+    """Approve a draft action and execute it.
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            # Get the draft
+            result = await session.execute(
+                select(ContableActionQueue).where(
+                    ContableActionQueue.id == uuid.UUID(draft_id)
+                )
+            )
+            action = result.scalar_one_or_none()
+
+            if not action:
+                raise HTTPException(status_code=404, detail="Draft not found")
+
+            if action.status != "pending":
+                raise HTTPException(status_code=400, detail=f"Draft is not pending (status: {action.status})")
+
+            # Execute the action
+            exec_result = await _execute_action(
+                client=client,
+                action_type=action.action_type,
+                action_data=action.action_data,
+            )
+
+            # Update the record
+            action.status = "executed"
+            action.reviewed_by = data.reviewed_by
+            action.reviewed_at = datetime.utcnow()
+            action.review_notes = data.notes
+            action.executed_at = datetime.utcnow()
+            action.execution_result = exec_result
+
+            await session.commit()
+
+            return {
+                "success": True,
+                "draft_id": draft_id,
+                "status": "executed",
+                "result": exec_result,
+                "reviewed_by": data.reviewed_by,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error approving draft: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/contable/agent/drafts/{draft_id}/reject")
+async def reject_draft_action(
+    draft_id: str,
+    data: DraftRejectRequest,
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Reject a draft action.
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(ContableActionQueue).where(
+                    ContableActionQueue.id == uuid.UUID(draft_id)
+                )
+            )
+            action = result.scalar_one_or_none()
+
+            if not action:
+                raise HTTPException(status_code=404, detail="Draft not found")
+
+            if action.status != "pending":
+                raise HTTPException(status_code=400, detail=f"Draft is not pending (status: {action.status})")
+
+            # Update the record
+            action.status = "rejected"
+            action.reviewed_by = data.reviewed_by
+            action.reviewed_at = datetime.utcnow()
+            action.review_notes = data.reason
+
+            await session.commit()
+
+            return {
+                "success": True,
+                "draft_id": draft_id,
+                "status": "rejected",
+                "reviewed_by": data.reviewed_by,
+                "reason": data.reason,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error rejecting draft: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/agent/stats", response_model=AgentStatsResponse)
+async def get_agent_stats(
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Get Contable AI Agent statistics.
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        # Return empty stats if no database
+        return AgentStatsResponse(
+            total_actions=0,
+            actions_by_status={},
+            actions_by_type={},
+            auto_executed_today=0,
+            drafts_pending=0,
+            avg_confidence=0,
+            total_amount_processed=0,
+        )
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select, func
+
+            # Total actions
+            total_result = await session.execute(
+                select(func.count(ContableActionQueue.id))
+            )
+            total_actions = total_result.scalar() or 0
+
+            # Actions by status
+            status_result = await session.execute(
+                select(
+                    ContableActionQueue.status,
+                    func.count(ContableActionQueue.id)
+                ).group_by(ContableActionQueue.status)
+            )
+            actions_by_status = {row[0]: row[1] for row in status_result.fetchall()}
+
+            # Actions by type
+            type_result = await session.execute(
+                select(
+                    ContableActionQueue.action_type,
+                    func.count(ContableActionQueue.id)
+                ).group_by(ContableActionQueue.action_type)
+            )
+            actions_by_type = {row[0]: row[1] for row in type_result.fetchall()}
+
+            # Auto-executed today
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            auto_today_result = await session.execute(
+                select(func.count(ContableActionQueue.id)).where(
+                    ContableActionQueue.status == "executed",
+                    ContableActionQueue.risk_level == "auto_execute",
+                    ContableActionQueue.executed_at >= today_start,
+                )
+            )
+            auto_executed_today = auto_today_result.scalar() or 0
+
+            # Pending drafts
+            pending_result = await session.execute(
+                select(func.count(ContableActionQueue.id)).where(
+                    ContableActionQueue.status == "pending"
+                )
+            )
+            drafts_pending = pending_result.scalar() or 0
+
+            # Average confidence
+            avg_conf_result = await session.execute(
+                select(func.avg(ContableActionQueue.confidence_score)).where(
+                    ContableActionQueue.confidence_score.isnot(None)
+                )
+            )
+            avg_confidence = float(avg_conf_result.scalar() or 0)
+
+            # Total amount processed
+            amount_result = await session.execute(
+                select(func.sum(ContableActionQueue.amount_eur)).where(
+                    ContableActionQueue.status == "executed"
+                )
+            )
+            total_amount = float(amount_result.scalar() or 0)
+
+            return AgentStatsResponse(
+                total_actions=total_actions,
+                actions_by_status=actions_by_status,
+                actions_by_type=actions_by_type,
+                auto_executed_today=auto_executed_today,
+                drafts_pending=drafts_pending,
+                avg_confidence=round(avg_confidence, 2),
+                total_amount_processed=round(total_amount, 2),
+            )
+
+    except Exception as e:
+        logger.error(f"Error getting agent stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/scheduler/status", response_model=SchedulerStatusResponse)
+async def get_scheduler_status():
+    """Get background job scheduler status.
+
+    No authentication required - read-only status endpoint.
+    """
+    settings = get_settings()
+
+    if not SCHEDULER_AVAILABLE:
+        return SchedulerStatusResponse(
+            enabled=False,
+            running=False,
+            jobs=[],
+            next_runs={},
+        )
+
+    if not _scheduler:
+        return SchedulerStatusResponse(
+            enabled=settings.scheduler_enabled,
+            running=False,
+            jobs=[],
+            next_runs={},
+        )
+
+    jobs = []
+    next_runs = {}
+
+    for job in _scheduler.get_jobs():
+        next_run = job.next_run_time.isoformat() if job.next_run_time else None
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run": next_run,
+        })
+        next_runs[job.id] = next_run
+
+    return SchedulerStatusResponse(
+        enabled=settings.scheduler_enabled,
+        running=_scheduler.running,
+        jobs=jobs,
+        next_runs=next_runs,
+    )
+
+
+@app.post("/api/v1/contable/jobs/reconcile")
+async def trigger_reconciliation_job(
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Manually trigger the reconciliation job.
+
+    Security: Requires service authentication.
+    """
+    try:
+        await run_daily_reconciliation()
+        return {"success": True, "message": "Reconciliation job completed"}
+    except Exception as e:
+        logger.error(f"Manual reconciliation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/contable/jobs/anomalies")
+async def trigger_anomaly_job(
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Manually trigger the anomaly detection job.
+
+    Security: Requires service authentication.
+    """
+    try:
+        await run_anomaly_check()
+        return {"success": True, "message": "Anomaly check job completed"}
+    except Exception as e:
+        logger.error(f"Manual anomaly check error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/contable/jobs/snapshot")
+async def trigger_snapshot_job(
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Manually trigger the daily snapshot job.
+
+    Security: Requires service authentication.
+    """
+    try:
+        await run_daily_snapshot()
+        return {"success": True, "message": "Snapshot job completed"}
+    except Exception as e:
+        logger.error(f"Manual snapshot error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/snapshots")
+async def list_snapshots(
+    days: int = Query(30, le=365),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """List daily financial snapshots for trend analysis.
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+            from datetime import timedelta
+
+            cutoff_date = date.today() - timedelta(days=days)
+
+            result = await session.execute(
+                select(ContableDailySnapshot).where(
+                    ContableDailySnapshot.snapshot_date >= cutoff_date
+                ).order_by(ContableDailySnapshot.snapshot_date.desc())
+            )
+            snapshots = result.scalars().all()
+
+            return {
+                "snapshots": [
+                    {
+                        "date": s.snapshot_date.isoformat(),
+                        "receivables": {
+                            "total": float(s.total_receivables or 0),
+                            "current": float(s.receivables_current or 0),
+                            "overdue_30": float(s.receivables_overdue_30 or 0),
+                            "overdue_60": float(s.receivables_overdue_60 or 0),
+                            "overdue_90": float(s.receivables_overdue_90 or 0),
+                            "overdue_90_plus": float(s.receivables_overdue_90_plus or 0),
+                        },
+                        "payables": {
+                            "total": float(s.total_payables or 0),
+                            "current": float(s.payables_current or 0),
+                            "overdue": float(s.payables_overdue or 0),
+                        },
+                        "bank_balance": float(s.bank_balance or 0) if s.bank_balance else None,
+                        "agent_activity": {
+                            "auto_executed": s.actions_auto_executed or 0,
+                            "drafted": s.actions_drafted or 0,
+                            "approved": s.actions_approved or 0,
+                            "rejected": s.actions_rejected or 0,
+                            "reconciliations": s.reconciliations_completed or 0,
+                        },
+                        "anomalies": {
+                            "detected": s.anomalies_detected or 0,
+                            "resolved": s.anomalies_resolved or 0,
+                        },
+                    }
+                    for s in snapshots
+                ],
+                "count": len(snapshots),
+                "days_requested": days,
+            }
+
+    except Exception as e:
+        logger.error(f"Error listing snapshots: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# QONTO BANKING ENDPOINTS
+# ============================================================================
+
+@app.get("/api/v1/qonto/balance")
+async def get_qonto_balance(
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Get Qonto account balance.
+
+    Security: Requires service authentication.
+    """
+    qonto = get_qonto_client()
+    if not qonto:
+        raise HTTPException(status_code=503, detail="Qonto client not configured")
+
+    try:
+        balance = qonto.get_balance()
+        return balance
+    except Exception as e:
+        logger.error(f"Error getting Qonto balance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/qonto/transactions")
+async def list_qonto_transactions(
+    side: Optional[str] = Query(None, description="Filter: credit (incoming) or debit (outgoing)"),
+    days: int = Query(30, le=365),
+    limit: int = Query(100, le=500),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """List Qonto transactions.
+
+    Security: Requires service authentication.
+    """
+    qonto = get_qonto_client()
+    if not qonto:
+        raise HTTPException(status_code=503, detail="Qonto client not configured")
+
+    try:
+        transactions = qonto.list_transactions(side=side, days=days, per_page=limit)
+        return {
+            "transactions": [t.to_dict() for t in transactions],
+            "count": len(transactions),
+            "filters": {
+                "side": side,
+                "days": days,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error listing Qonto transactions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/qonto/credits")
+async def list_qonto_credits(
+    days: int = Query(30, le=365),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """List incoming payments (credits) from Qonto.
+
+    Security: Requires service authentication.
+    """
+    qonto = get_qonto_client()
+    if not qonto:
+        raise HTTPException(status_code=503, detail="Qonto client not configured")
+
+    try:
+        credits = qonto.list_credits(days=days)
+        return {
+            "credits": [t.to_dict() for t in credits],
+            "count": len(credits),
+            "total_amount": sum(float(t.amount) for t in credits),
+            "days": days,
+        }
+    except Exception as e:
+        logger.error(f"Error listing Qonto credits: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/qonto/search")
+async def search_qonto_transactions(
+    query: str = Query(..., description="Search query (label, reference, or note)"),
+    days: int = Query(90, le=365),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Search Qonto transactions by label or reference.
+
+    Security: Requires service authentication.
+    """
+    qonto = get_qonto_client()
+    if not qonto:
+        raise HTTPException(status_code=503, detail="Qonto client not configured")
+
+    try:
+        matches = qonto.search_transactions(query=query, days=days)
+        return {
+            "matches": [t.to_dict() for t in matches],
+            "count": len(matches),
+            "query": query,
+            "days": days,
+        }
+    except Exception as e:
+        logger.error(f"Error searching Qonto transactions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/qonto/find-payment")
+async def find_payment_for_invoice(
+    invoice_number: str = Query(..., description="Invoice number to match (e.g., FA-2026-0123)"),
+    amount: Optional[float] = Query(None, description="Expected amount (for better matching)"),
+    days: int = Query(90, le=365),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Find potential payment matches for an invoice.
+
+    Searches Qonto credits for transactions matching the invoice number
+    and/or amount.
+
+    Security: Requires service authentication.
+    """
+    qonto = get_qonto_client()
+    if not qonto:
+        raise HTTPException(status_code=503, detail="Qonto client not configured")
+
+    try:
+        matches = qonto.find_payment_for_invoice(
+            invoice_number=invoice_number,
+            amount=amount,
+            days=days,
+        )
+        return {
+            "matches": [t.to_dict() for t in matches],
+            "count": len(matches),
+            "invoice_number": invoice_number,
+            "expected_amount": amount,
+            "best_match": matches[0].to_dict() if matches else None,
+        }
+    except Exception as e:
+        logger.error(f"Error finding payment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/qonto/reconciliation/pending")
+async def list_pending_reconciliation_matches(
+    limit: int = Query(50, le=200),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """List pending reconciliation matches awaiting approval.
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(ContableReconciliationMatch).where(
+                    ContableReconciliationMatch.status == "pending"
+                ).order_by(
+                    ContableReconciliationMatch.match_confidence.desc()
+                ).limit(limit)
+            )
+            matches = result.scalars().all()
+
+            return {
+                "matches": [
+                    {
+                        "id": str(m.id),
+                        "qonto": {
+                            "transaction_id": m.qonto_transaction_id,
+                            "amount": float(m.qonto_amount),
+                            "date": m.qonto_date.isoformat() if m.qonto_date else None,
+                            "counterparty": m.qonto_counterparty,
+                            "reference": m.qonto_reference,
+                        },
+                        "holded": {
+                            "document_id": m.holded_document_id,
+                            "document_type": m.holded_document_type,
+                            "document_number": m.holded_document_number,
+                            "amount": float(m.holded_amount) if m.holded_amount else None,
+                            "contact_name": m.holded_contact_name,
+                        },
+                        "match": {
+                            "confidence": float(m.match_confidence),
+                            "type": m.match_type,
+                            "details": m.match_details,
+                        },
+                        "status": m.status,
+                        "created_at": m.created_at.isoformat(),
+                    }
+                    for m in matches
+                ],
+                "count": len(matches),
+            }
+    except Exception as e:
+        logger.error(f"Error listing pending matches: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/qonto/reconciliation/{match_id}/approve")
+async def approve_reconciliation_match(
+    match_id: str,
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+    client: HoldedClient = Depends(get_client),
+):
+    """Approve a reconciliation match and mark the document as paid.
+
+    This will:
+    1. Mark the Holded document as paid
+    2. Update the reconciliation match status
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    settings = get_settings()
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            # Get the match
+            result = await session.execute(
+                select(ContableReconciliationMatch).where(
+                    ContableReconciliationMatch.id == uuid.UUID(match_id)
+                )
+            )
+            match = result.scalar_one_or_none()
+
+            if not match:
+                raise HTTPException(status_code=404, detail="Match not found")
+
+            if match.status != "pending":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Match is not pending (status: {match.status})"
+                )
+
+            # Mark document as paid in Holded
+            payment_data = {
+                "amount": float(match.qonto_amount),
+                "date": int(match.qonto_date.timestamp()) if match.qonto_date else int(time.time()),
+                "bankId": settings.holded_treasury_id,
+            }
+
+            try:
+                result = client.pay_document(
+                    match.holded_document_id,
+                    payment_data,
+                    doc_type=match.holded_document_type,
+                )
+            except Exception as e:
+                logger.error(f"Failed to mark document as paid: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to mark as paid: {e}")
+
+            # Update match status
+            match.status = "executed"
+            match.reconciled_at = datetime.utcnow()
+
+            await session.commit()
+
+            # Invalidate cache
+            await invalidate_cache(f"holded:docs:{match.holded_document_type}:*")
+
+            return {
+                "success": True,
+                "match_id": match_id,
+                "document_id": match.holded_document_id,
+                "document_number": match.holded_document_number,
+                "amount": float(match.qonto_amount),
+                "status": "executed",
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error approving match: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/qonto/reconciliation/{match_id}/reject")
+async def reject_reconciliation_match(
+    match_id: str,
+    reason: str = Query(..., description="Reason for rejection"),
+    service_auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """Reject a reconciliation match.
+
+    Security: Requires service authentication.
+    """
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(ContableReconciliationMatch).where(
+                    ContableReconciliationMatch.id == uuid.UUID(match_id)
+                )
+            )
+            match = result.scalar_one_or_none()
+
+            if not match:
+                raise HTTPException(status_code=404, detail="Match not found")
+
+            if match.status != "pending":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Match is not pending (status: {match.status})"
+                )
+
+            # Update match status
+            match.status = "rejected"
+            match.match_details = {
+                **(match.match_details or {}),
+                "rejection_reason": reason,
+                "rejected_at": datetime.utcnow().isoformat(),
+            }
+
+            await session.commit()
+
+            return {
+                "success": True,
+                "match_id": match_id,
+                "status": "rejected",
+                "reason": reason,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error rejecting match: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
