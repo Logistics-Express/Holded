@@ -4,8 +4,13 @@ Internal microservice for Holded ERP operations.
 
 Endpoints:
 - /health - Health check
-- /api/v1/contacts - Contact management
+- /api/v1/contacts - Contact CRUD
 - /api/v1/documents - Document operations (invoices, estimates, proformas)
+- /api/v1/products - Product catalog CRUD
+- /api/v1/services - Service catalog CRUD
+- /api/v1/payments - Payment management
+- /api/v1/treasuries - Bank accounts
+- /api/v1/accounting - Trial balance, ledger, journal entries
 - /api/v1/debt - Debt/outstanding invoice checking
 """
 
@@ -16,8 +21,10 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+import time
 
 from fastapi import FastAPI, HTTPException, Query, Depends, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -43,7 +50,7 @@ if not lib_loaded:
 # Add app directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from holded.holded_client import HoldedClient, DocumentBuilder
+from holded.holded_client import HoldedClient, DocumentBuilder, JournalEntryBuilder
 
 # Import app modules
 from app.config import get_settings, Settings
@@ -121,7 +128,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Holded API Service",
     description="Internal microservice for Holded ERP operations",
-    version="1.1.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -193,6 +200,110 @@ class InvoiceLookupRequest(BaseModel):
     invoice_number: str
 
 
+# Phase 1: Critical Operations Models
+class ContactUpdate(BaseModel):
+    """Update contact request."""
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    nif: Optional[str] = Field(None, description="NIF/CIF")
+    address: Optional[str] = None
+    city: Optional[str] = None
+    province: Optional[str] = None
+    postal_code: Optional[str] = None
+    country: Optional[str] = None
+
+
+class PaymentData(BaseModel):
+    """Payment data for marking document as paid."""
+    amount: float
+    date: Optional[int] = Field(None, description="Unix timestamp")
+    treasury_id: Optional[str] = Field(None, description="Bank account ID")
+
+
+class CloneRequest(BaseModel):
+    """Clone document request."""
+    target_type: str = Field(..., description="Target doc type: invoice, salesorder, proform, etc.")
+    new_contact_id: Optional[str] = None
+    new_date: Optional[int] = Field(None, description="Unix timestamp, defaults to now")
+
+
+# Phase 2: Catalog Management Models
+class ProductCreate(BaseModel):
+    """Create product request."""
+    name: str
+    price: float = Field(..., description="Sale price")
+    cost_price: Optional[float] = Field(None, description="Cost price for margin calculation")
+    tax: int = Field(21, description="Tax rate percentage")
+    sku: Optional[str] = None
+    desc: Optional[str] = None
+    stock: Optional[float] = None
+
+
+class ProductUpdate(BaseModel):
+    """Update product request."""
+    name: Optional[str] = None
+    price: Optional[float] = None
+    cost_price: Optional[float] = None
+    tax: Optional[int] = None
+    sku: Optional[str] = None
+    desc: Optional[str] = None
+    stock: Optional[float] = None
+
+
+class ServiceCreate(BaseModel):
+    """Create service request."""
+    name: str
+    price: float = Field(..., description="Sale price")
+    cost_price: Optional[float] = Field(None, description="Cost price for margin calculation")
+    tax: int = Field(21, description="Tax rate percentage")
+    desc: Optional[str] = None
+
+
+class ServiceUpdate(BaseModel):
+    """Update service request."""
+    name: Optional[str] = None
+    price: Optional[float] = None
+    cost_price: Optional[float] = None
+    tax: Optional[int] = None
+    desc: Optional[str] = None
+
+
+# Phase 3: Financial Operations Models
+class PaymentCreate(BaseModel):
+    """Create payment request."""
+    contact_id: str
+    amount: float
+    date: Optional[int] = Field(None, description="Unix timestamp")
+    treasury_id: Optional[str] = Field(None, description="Bank account ID")
+    notes: Optional[str] = None
+    document_id: Optional[str] = Field(None, description="Link to invoice/document")
+
+
+class DocumentUpdate(BaseModel):
+    """Update document request."""
+    notes: Optional[str] = None
+    due_date: Optional[int] = Field(None, description="Unix timestamp")
+    contact_id: Optional[str] = None
+
+
+# Phase 4: Accounting Models
+class JournalLineItem(BaseModel):
+    """Journal entry line item."""
+    account_id: str
+    debit: float = 0
+    credit: float = 0
+    description: Optional[str] = None
+
+
+class JournalEntryCreate(BaseModel):
+    """Create journal entry request."""
+    description: str
+    reference: Optional[str] = None
+    date: Optional[int] = Field(None, description="Unix timestamp")
+    lines: List[JournalLineItem]
+
+
 # ============================================================================
 # HEALTH
 # ============================================================================
@@ -204,7 +315,7 @@ async def health_check():
     status = {
         "status": "healthy",
         "service": "holded-api",
-        "version": "1.1.0",
+        "version": "2.0.0",
     }
 
     # Check Redis
@@ -320,6 +431,69 @@ async def create_contact(
         return {"success": True, "contact_id": result.get("id"), "contact": result}
     except Exception as e:
         logger.error(f"Error creating contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/v1/contacts/{contact_id}")
+async def update_contact(
+    contact_id: str,
+    data: ContactUpdate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Update an existing contact."""
+    try:
+        update_data = {}
+        if data.name is not None:
+            update_data["name"] = data.name
+        if data.email is not None:
+            update_data["email"] = data.email
+        if data.phone is not None:
+            update_data["phone"] = data.phone
+        if data.nif is not None:
+            update_data["code"] = data.nif
+
+        # Build address if any address fields provided
+        address_fields = {}
+        if data.address is not None:
+            address_fields["address"] = data.address
+        if data.city is not None:
+            address_fields["city"] = data.city
+        if data.province is not None:
+            address_fields["province"] = data.province
+        if data.postal_code is not None:
+            address_fields["postalCode"] = data.postal_code
+        if data.country is not None:
+            address_fields["country"] = data.country
+
+        if address_fields:
+            update_data["billAddress"] = address_fields
+
+        result = client.update_contact(contact_id, update_data)
+
+        # Invalidate contacts cache
+        await invalidate_cache("holded:contacts:*")
+
+        return {"success": True, "contact_id": contact_id, "contact": result}
+    except Exception as e:
+        logger.error(f"Error updating contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/contacts/{contact_id}")
+async def delete_contact(
+    contact_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Delete a contact."""
+    try:
+        client.delete_contact(contact_id)
+
+        # Invalidate contacts cache
+        await invalidate_cache("holded:contacts:*")
+
+        return {"success": True, "deleted": contact_id}
+    except Exception as e:
+        logger.error(f"Error deleting contact: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -445,6 +619,136 @@ async def send_document(
         return {"success": True, "result": result}
     except Exception as e:
         logger.error(f"Error sending document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/documents/{doc_type}/{document_id}/pdf")
+async def get_document_pdf(
+    doc_type: str,
+    document_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Download document as PDF."""
+    try:
+        pdf_bytes = client.get_document_pdf(document_id, doc_type=doc_type)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={doc_type}_{document_id}.pdf"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error getting document PDF: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/documents/{document_id}/clone")
+async def clone_document(
+    document_id: str,
+    data: CloneRequest,
+    client: HoldedClient = Depends(get_client)
+):
+    """Clone a document to a new type (e.g., estimate → invoice)."""
+    try:
+        result = client.clone_document(
+            source_id=document_id,
+            target_type=data.target_type,
+            new_contact_id=data.new_contact_id,
+            new_date=data.new_date,
+        )
+
+        # Invalidate cache for target document type
+        await invalidate_cache(f"holded:docs:{data.target_type}:*")
+
+        return {
+            "success": True,
+            "source_id": document_id,
+            "new_document_id": result.get("id"),
+            "new_document_number": result.get("docNumber"),
+            "target_type": data.target_type,
+        }
+    except Exception as e:
+        logger.error(f"Error cloning document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/documents/{doc_type}/{document_id}/pay")
+async def pay_document(
+    doc_type: str,
+    document_id: str,
+    data: PaymentData,
+    client: HoldedClient = Depends(get_client)
+):
+    """Mark a document as paid."""
+    try:
+        payment_data = {
+            "amount": data.amount,
+        }
+        if data.date:
+            payment_data["date"] = data.date
+        else:
+            payment_data["date"] = int(time.time())
+        if data.treasury_id:
+            payment_data["bankId"] = data.treasury_id
+
+        result = client.pay_document(document_id, payment_data, doc_type=doc_type)
+
+        # Invalidate document cache
+        await invalidate_cache(f"holded:docs:{doc_type}:*")
+
+        return {"success": True, "document_id": document_id, "result": result}
+    except Exception as e:
+        logger.error(f"Error paying document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/v1/documents/{doc_type}/{document_id}")
+async def update_document(
+    doc_type: str,
+    document_id: str,
+    data: DocumentUpdate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Update a document (notes, due date, etc.)."""
+    try:
+        update_data = {}
+        if data.notes is not None:
+            update_data["notes"] = data.notes
+        if data.due_date is not None:
+            update_data["dueDate"] = data.due_date
+        if data.contact_id is not None:
+            update_data["contactId"] = data.contact_id
+
+        result = client.update_document(document_id, update_data, doc_type=doc_type)
+
+        # Invalidate document cache
+        await invalidate_cache(f"holded:docs:{doc_type}:*")
+        await invalidate_cache(f"holded:docs:single:*")
+
+        return {"success": True, "document_id": document_id, "document": result}
+    except Exception as e:
+        logger.error(f"Error updating document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/documents/{doc_type}/{document_id}")
+async def delete_document(
+    doc_type: str,
+    document_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Delete a document."""
+    try:
+        client.delete_document(document_id, doc_type=doc_type)
+
+        # Invalidate document cache
+        await invalidate_cache(f"holded:docs:{doc_type}:*")
+        await invalidate_cache(f"holded:docs:single:*")
+
+        return {"success": True, "deleted": document_id}
+    except Exception as e:
+        logger.error(f"Error deleting document: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -804,6 +1108,609 @@ async def _find_contact_id(
                 return contact.get("id")
 
     return None
+
+
+# ============================================================================
+# PRODUCTS (Phase 2)
+# ============================================================================
+
+@app.get("/api/v1/products")
+@cached(ttl=900, prefix="products:list")
+async def list_products(
+    request: Request,
+    limit: int = Query(50, le=500),
+    client: HoldedClient = Depends(get_client)
+):
+    """List products."""
+    try:
+        products = client.list_products(limit=limit)
+        return {"products": products, "count": len(products)}
+    except Exception as e:
+        logger.error(f"Error listing products: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/products/{product_id}")
+@cached(ttl=600, prefix="products:id")
+async def get_product(
+    request: Request,
+    product_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get product by ID."""
+    try:
+        product = client.get_product(product_id)
+        return product
+    except Exception as e:
+        logger.error(f"Error getting product: {e}")
+        raise HTTPException(status_code=404, detail="Product not found")
+
+
+@app.post("/api/v1/products")
+async def create_product(
+    data: ProductCreate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Create a new product."""
+    try:
+        product_data = {
+            "name": data.name,
+            "price": data.price,
+            "tax": data.tax,
+        }
+        if data.cost_price is not None:
+            product_data["costPrice"] = data.cost_price
+        if data.sku:
+            product_data["sku"] = data.sku
+        if data.desc:
+            product_data["desc"] = data.desc
+        if data.stock is not None:
+            product_data["stock"] = data.stock
+
+        result = client.create_product(product_data)
+
+        # Invalidate products cache
+        await invalidate_cache("holded:products:*")
+
+        return {"success": True, "product_id": result.get("id"), "product": result}
+    except Exception as e:
+        logger.error(f"Error creating product: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/v1/products/{product_id}")
+async def update_product(
+    product_id: str,
+    data: ProductUpdate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Update an existing product."""
+    try:
+        update_data = {}
+        if data.name is not None:
+            update_data["name"] = data.name
+        if data.price is not None:
+            update_data["price"] = data.price
+        if data.cost_price is not None:
+            update_data["costPrice"] = data.cost_price
+        if data.tax is not None:
+            update_data["tax"] = data.tax
+        if data.sku is not None:
+            update_data["sku"] = data.sku
+        if data.desc is not None:
+            update_data["desc"] = data.desc
+        if data.stock is not None:
+            update_data["stock"] = data.stock
+
+        result = client.update_product(product_id, update_data)
+
+        # Invalidate products cache
+        await invalidate_cache("holded:products:*")
+
+        return {"success": True, "product_id": product_id, "product": result}
+    except Exception as e:
+        logger.error(f"Error updating product: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/products/{product_id}")
+async def delete_product(
+    product_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Delete a product."""
+    try:
+        client.delete_product(product_id)
+
+        # Invalidate products cache
+        await invalidate_cache("holded:products:*")
+
+        return {"success": True, "deleted": product_id}
+    except Exception as e:
+        logger.error(f"Error deleting product: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# SERVICES (Phase 2)
+# ============================================================================
+
+@app.get("/api/v1/services")
+@cached(ttl=900, prefix="services:list")
+async def list_services(
+    request: Request,
+    limit: int = Query(50, le=500),
+    client: HoldedClient = Depends(get_client)
+):
+    """List services."""
+    try:
+        services = client.list_services()
+        return {"services": services, "count": len(services)}
+    except Exception as e:
+        logger.error(f"Error listing services: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/services/{service_id}")
+@cached(ttl=600, prefix="services:id")
+async def get_service(
+    request: Request,
+    service_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get service by ID."""
+    try:
+        service = client.get_service(service_id)
+        return service
+    except Exception as e:
+        logger.error(f"Error getting service: {e}")
+        raise HTTPException(status_code=404, detail="Service not found")
+
+
+@app.post("/api/v1/services")
+async def create_service(
+    data: ServiceCreate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Create a new service."""
+    try:
+        service_data = {
+            "name": data.name,
+            "price": data.price,
+            "tax": data.tax,
+        }
+        if data.cost_price is not None:
+            service_data["costPrice"] = data.cost_price
+        if data.desc:
+            service_data["desc"] = data.desc
+
+        result = client.create_service(service_data)
+
+        # Invalidate services cache
+        await invalidate_cache("holded:services:*")
+
+        return {"success": True, "service_id": result.get("id"), "service": result}
+    except Exception as e:
+        logger.error(f"Error creating service: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/v1/services/{service_id}")
+async def update_service(
+    service_id: str,
+    data: ServiceUpdate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Update an existing service."""
+    try:
+        update_data = {}
+        if data.name is not None:
+            update_data["name"] = data.name
+        if data.price is not None:
+            update_data["price"] = data.price
+        if data.cost_price is not None:
+            update_data["costPrice"] = data.cost_price
+        if data.tax is not None:
+            update_data["tax"] = data.tax
+        if data.desc is not None:
+            update_data["desc"] = data.desc
+
+        result = client.update_service(service_id, update_data)
+
+        # Invalidate services cache
+        await invalidate_cache("holded:services:*")
+
+        return {"success": True, "service_id": service_id, "service": result}
+    except Exception as e:
+        logger.error(f"Error updating service: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/services/{service_id}")
+async def delete_service(
+    service_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Delete a service."""
+    try:
+        client.delete_service(service_id)
+
+        # Invalidate services cache
+        await invalidate_cache("holded:services:*")
+
+        return {"success": True, "deleted": service_id}
+    except Exception as e:
+        logger.error(f"Error deleting service: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# PAYMENTS (Phase 3)
+# ============================================================================
+
+@app.get("/api/v1/payments")
+@cached(ttl=300, prefix="payments:list")
+async def list_payments(
+    request: Request,
+    limit: int = Query(50, le=500),
+    client: HoldedClient = Depends(get_client)
+):
+    """List payments."""
+    try:
+        payments = client.list_payments(limit=limit)
+        return {"payments": payments, "count": len(payments)}
+    except Exception as e:
+        logger.error(f"Error listing payments: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/payments/{payment_id}")
+@cached(ttl=300, prefix="payments:id")
+async def get_payment(
+    request: Request,
+    payment_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get payment by ID."""
+    try:
+        payment = client.get_payment(payment_id)
+        return payment
+    except Exception as e:
+        logger.error(f"Error getting payment: {e}")
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+
+@app.post("/api/v1/payments")
+async def create_payment(
+    data: PaymentCreate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Create a new payment."""
+    try:
+        payment_data = {
+            "contactId": data.contact_id,
+            "amount": data.amount,
+        }
+        if data.date:
+            payment_data["date"] = data.date
+        else:
+            payment_data["date"] = int(time.time())
+        if data.treasury_id:
+            payment_data["bankId"] = data.treasury_id
+        if data.notes:
+            payment_data["notes"] = data.notes
+        if data.document_id:
+            payment_data["docId"] = data.document_id
+
+        result = client.create_payment(payment_data)
+
+        # Invalidate payments cache
+        await invalidate_cache("holded:payments:*")
+
+        return {"success": True, "payment_id": result.get("id"), "payment": result}
+    except Exception as e:
+        logger.error(f"Error creating payment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/payments/{payment_id}")
+async def delete_payment(
+    payment_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Delete a payment."""
+    try:
+        client.delete_payment(payment_id)
+
+        # Invalidate payments cache
+        await invalidate_cache("holded:payments:*")
+
+        return {"success": True, "deleted": payment_id}
+    except Exception as e:
+        logger.error(f"Error deleting payment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# TREASURIES (Phase 3)
+# ============================================================================
+
+@app.get("/api/v1/treasuries")
+@cached(ttl=1800, prefix="treasuries:list")
+async def list_treasuries(
+    request: Request,
+    client: HoldedClient = Depends(get_client)
+):
+    """List treasury/bank accounts."""
+    try:
+        treasuries = client.list_treasuries()
+        return {"treasuries": treasuries, "count": len(treasuries)}
+    except Exception as e:
+        logger.error(f"Error listing treasuries: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ACCOUNTING (Phase 4)
+# ============================================================================
+
+@app.get("/api/v1/accounting/accounts")
+@cached(ttl=1800, prefix="accounting:accounts")
+async def list_chart_of_accounts(
+    request: Request,
+    limit: int = Query(500, le=1000),
+    client: HoldedClient = Depends(get_client)
+):
+    """List chart of accounts."""
+    try:
+        accounts = client.list_chart_of_accounts(limit=limit)
+        return {"accounts": accounts, "count": len(accounts)}
+    except Exception as e:
+        logger.error(f"Error listing accounts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accounting/accounts/{account_id}")
+@cached(ttl=1800, prefix="accounting:account")
+async def get_account(
+    request: Request,
+    account_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get account by ID."""
+    try:
+        account = client.get_account(account_id)
+        return account
+    except Exception as e:
+        logger.error(f"Error getting account: {e}")
+        raise HTTPException(status_code=404, detail="Account not found")
+
+
+@app.get("/api/v1/accounting/accounts/code/{code}")
+@cached(ttl=1800, prefix="accounting:account:code")
+async def get_account_by_code(
+    request: Request,
+    code: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get account by code (e.g., '4300', '7000')."""
+    try:
+        account = client.get_account_by_code(code)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account with code {code} not found")
+        return account
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting account by code: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accounting/ledger")
+@cached(ttl=300, prefix="accounting:ledger")
+async def list_daily_ledger(
+    request: Request,
+    account_id: Optional[str] = None,
+    date_from: Optional[int] = Query(None, description="Unix timestamp start"),
+    date_to: Optional[int] = Query(None, description="Unix timestamp end"),
+    limit: int = Query(100, le=500),
+    client: HoldedClient = Depends(get_client)
+):
+    """List daily ledger entries with optional filtering."""
+    try:
+        entries = client.list_daily_ledger_filtered(
+            account_id=account_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit
+        )
+        return {"entries": entries, "count": len(entries)}
+    except Exception as e:
+        logger.error(f"Error listing ledger: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accounting/ledger/{entry_id}")
+@cached(ttl=300, prefix="accounting:ledger:id")
+async def get_ledger_entry(
+    request: Request,
+    entry_id: str,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get daily ledger entry by ID."""
+    try:
+        entry = client.get_daily_ledger_entry(entry_id)
+        return entry
+    except Exception as e:
+        logger.error(f"Error getting ledger entry: {e}")
+        raise HTTPException(status_code=404, detail="Ledger entry not found")
+
+
+@app.post("/api/v1/accounting/journal-entry")
+async def create_journal_entry(
+    data: JournalEntryCreate,
+    client: HoldedClient = Depends(get_client)
+):
+    """Create a new journal entry (daily ledger entry)."""
+    try:
+        # Build journal entry using JournalEntryBuilder
+        builder = JournalEntryBuilder(
+            description=data.description,
+            reference=data.reference or "",
+            date=data.date,
+        )
+
+        for line in data.lines:
+            if line.debit > 0:
+                builder.add_debit(
+                    account_id=line.account_id,
+                    amount=line.debit,
+                    description=line.description or "",
+                )
+            if line.credit > 0:
+                builder.add_credit(
+                    account_id=line.account_id,
+                    amount=line.credit,
+                    description=line.description or "",
+                )
+
+        # Validate before creating
+        errors = builder.validate()
+        if errors:
+            raise HTTPException(status_code=400, detail="; ".join(errors))
+
+        result = client.create_journal_entry_with_builder(builder)
+
+        # Invalidate accounting cache
+        await invalidate_cache("holded:accounting:*")
+
+        return {"success": True, "entry_id": result.get("id"), "entry": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating journal entry: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accounting/trial-balance")
+@cached(ttl=300, prefix="accounting:trial-balance")
+async def get_trial_balance(
+    request: Request,
+    date_from: Optional[int] = Query(None, description="Unix timestamp start"),
+    date_to: Optional[int] = Query(None, description="Unix timestamp end"),
+    client: HoldedClient = Depends(get_client)
+):
+    """Get trial balance (sum of debits and credits per account).
+
+    Returns accounts with their total debits, credits, and balance.
+    """
+    try:
+        # Get all ledger entries in date range
+        entries = client.list_daily_ledger_filtered(
+            date_from=date_from,
+            date_to=date_to,
+            limit=10000
+        )
+
+        # Get chart of accounts for names
+        accounts_list = client.list_chart_of_accounts(limit=1000)
+        account_names = {a.get("id"): {"code": a.get("code"), "name": a.get("name")} for a in accounts_list}
+
+        # Aggregate by account
+        account_totals: Dict[str, Dict[str, Any]] = {}
+
+        for entry in entries:
+            for line in entry.get("lines", []):
+                acc_id = line.get("accountId")
+                if not acc_id:
+                    continue
+
+                if acc_id not in account_totals:
+                    acc_info = account_names.get(acc_id, {})
+                    account_totals[acc_id] = {
+                        "account_id": acc_id,
+                        "code": acc_info.get("code", ""),
+                        "name": acc_info.get("name", ""),
+                        "total_debit": 0.0,
+                        "total_credit": 0.0,
+                    }
+
+                account_totals[acc_id]["total_debit"] += float(line.get("debit", 0))
+                account_totals[acc_id]["total_credit"] += float(line.get("credit", 0))
+
+        # Calculate balances
+        result = []
+        total_debits = 0.0
+        total_credits = 0.0
+
+        for acc_id, totals in sorted(account_totals.items(), key=lambda x: x[1].get("code", "")):
+            balance = totals["total_debit"] - totals["total_credit"]
+            result.append({
+                **totals,
+                "balance": round(balance, 2),
+                "total_debit": round(totals["total_debit"], 2),
+                "total_credit": round(totals["total_credit"], 2),
+            })
+            total_debits += totals["total_debit"]
+            total_credits += totals["total_credit"]
+
+        return {
+            "accounts": result,
+            "totals": {
+                "debit": round(total_debits, 2),
+                "credit": round(total_credits, 2),
+                "balance": round(total_debits - total_credits, 2),
+            },
+            "is_balanced": abs(total_debits - total_credits) < 0.01,
+            "count": len(result),
+        }
+    except Exception as e:
+        logger.error(f"Error getting trial balance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/accounting/account/{account_id}/ledger")
+@cached(ttl=300, prefix="accounting:account:ledger")
+async def get_account_ledger(
+    request: Request,
+    account_id: str,
+    date_from: Optional[int] = Query(None, description="Unix timestamp start"),
+    date_to: Optional[int] = Query(None, description="Unix timestamp end"),
+    limit: int = Query(100, le=500),
+    client: HoldedClient = Depends(get_client)
+):
+    """Get ledger entries for a specific account."""
+    try:
+        entries = client.list_daily_ledger_filtered(
+            account_id=account_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit
+        )
+
+        # Calculate running balance
+        total_debit = 0.0
+        total_credit = 0.0
+
+        for entry in entries:
+            for line in entry.get("lines", []):
+                if line.get("accountId") == account_id:
+                    total_debit += float(line.get("debit", 0))
+                    total_credit += float(line.get("credit", 0))
+
+        return {
+            "account_id": account_id,
+            "entries": entries,
+            "count": len(entries),
+            "totals": {
+                "debit": round(total_debit, 2),
+                "credit": round(total_credit, 2),
+                "balance": round(total_debit - total_credit, 2),
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting account ledger: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
