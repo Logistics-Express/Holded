@@ -447,6 +447,11 @@ Analiza esta solicitud y devuelve tu respuesta en JSON.
 
         # No function call - parse text response
         content = message.content or "{}"
+        # Strip markdown code blocks if present
+        if content.startswith("```"):
+            lines = content.split("\n")
+            # Remove first line (```json) and last line (```)
+            content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
         try:
             result = json.loads(content)
             # Add risk assessment if not present
