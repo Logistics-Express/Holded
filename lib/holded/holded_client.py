@@ -1856,9 +1856,9 @@ class HoldedClient:
 
         Args:
             doc_type: Filter by document type (invoice, estimate, etc.)
-            contact_id: Filter by contact ID
-            date_from: Unix timestamp for start date
-            date_to: Unix timestamp for end date
+            contact_id: Filter by contact ID (maps to Holded 'contactid')
+            date_from: Unix timestamp for start date (maps to Holded 'starttmp')
+            date_to: Unix timestamp for end date (maps to Holded 'endtmp')
             limit: Maximum items to return
 
         Returns:
@@ -1866,11 +1866,11 @@ class HoldedClient:
         """
         params: Dict[str, Any] = {}
         if contact_id:
-            params["contactId"] = contact_id
+            params["contactid"] = contact_id
         if date_from:
-            params["dateFrom"] = date_from
+            params["starttmp"] = date_from
         if date_to:
-            params["dateTo"] = date_to
+            params["endtmp"] = date_to
 
         # Holded API requires document type in path, not query param
         if doc_type:
