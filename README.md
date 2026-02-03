@@ -6,11 +6,12 @@ Internal microservice providing a REST API for [Holded ERP](https://www.holded.c
 
 ## Features
 
-- **45 REST endpoints** covering contacts, documents, products, services, payments, and accounting
+- **55+ REST endpoints** covering contacts, documents, products, services, payments, and accounting
+- **Contable Agent** - Autonomous accounting with dashboard, expense classification, overdue management, anomaly detection
 - **Redis caching** with configurable TTLs and pattern-based invalidation
 - **PostgreSQL audit logging** for all requests
 - **Document workflows** - Clone estimates to invoices, download PDFs, mark as paid
-- **Accounting module** - Trial balance, journal entries, chart of accounts
+- **Accounting module** - Trial balance, income statement, balance sheet, journal entries
 - **Rate limiting** - Automatic retry with exponential backoff
 
 ## Quick Start
@@ -537,6 +538,85 @@ Response:
 ```
 GET /api/v1/accounting/account/{account_id}/ledger?date_from=xxx&date_to=xxx&limit=100
 ```
+
+---
+
+### Contable Agent (Autonomous Accounting)
+
+The Contable agent provides autonomous accounting operations with a supervised autonomy model (draft-approve-execute pattern).
+
+#### Dashboard
+```
+GET /api/v1/contable/dashboard
+```
+Returns comprehensive accounting overview: receivables, payables, overdue buckets, and alerts.
+
+#### Income Statement (P&L)
+```
+GET /api/v1/contable/reports/income-statement?date_from=2024-01-01&date_to=2024-12-31
+```
+Returns revenue, expenses, and net income for the period.
+
+#### Balance Sheet
+```
+GET /api/v1/contable/reports/balance-sheet?as_of_date=2024-12-31
+```
+Returns assets, liabilities, equity, and retained earnings.
+
+#### Expense Classification
+```
+GET /api/v1/contable/classify?description=Gasóleo para transporte&supplier=Repsol
+POST /api/v1/contable/classify?description=...&supplier=...
+```
+AI-assisted classification to Spanish PGC (Plan General Contable) account codes.
+
+Response:
+```json
+{
+  "account_code": "6280",
+  "account_name": "Combustibles",
+  "confidence": 0.85,
+  "method": "keyword",
+  "alternative_codes": ["6230", "6290"]
+}
+```
+
+#### Overdue Invoices
+```
+GET /api/v1/contable/overdue
+```
+Returns overdue invoices categorized by age bucket with recommended actions:
+- **0-30 days**: Monitor
+- **31-60 days**: Friendly reminder
+- **61-90 days**: Formal notice (Ley 3/2004)
+- **90+ days**: Legal escalation
+
+#### Create Escalation Draft
+```
+POST /api/v1/contable/overdue/{invoice_id}/escalate?to_legal=false
+```
+Creates draft escalation action for human approval.
+
+#### Anomaly Detection
+```
+GET /api/v1/contable/anomalies
+```
+Detects accounting anomalies:
+- Duplicate invoice numbers (severity: high)
+- Unusual amounts >3σ (severity: medium)
+- Same-day duplicate purchases (severity: medium)
+
+#### Agent Action Queue
+```
+GET /api/v1/contable/agent/queue
+```
+Returns pending actions requiring human approval.
+
+#### Daily Summary
+```
+GET /api/v1/contable/summary
+```
+Optimized summary for Secretary dashboard integration.
 
 ---
 

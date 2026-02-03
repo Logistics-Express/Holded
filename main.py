@@ -304,6 +304,139 @@ class JournalEntryCreate(BaseModel):
     lines: List[JournalLineItem]
 
 
+# Phase 5: Contable Agent Models
+class ExpenseClassification(BaseModel):
+    """Expense classification result."""
+    account_code: str
+    account_name: str
+    confidence: float
+    method: str  # keyword, supplier, ai
+    alternative_codes: List[str] = []
+
+
+class ReconciliationMatch(BaseModel):
+    """Payment-document match for reconciliation."""
+    payment_id: str
+    payment_amount: float
+    payment_date: str
+    payment_reference: str
+    document_id: str
+    document_type: str
+    document_number: str
+    document_amount: float
+    contact_name: str
+    match_confidence: float
+    match_type: str  # exact_amount, reference, name_similarity
+    can_auto_approve: bool = False
+
+
+class OverdueInvoice(BaseModel):
+    """Overdue invoice with bucket classification."""
+    invoice_id: str
+    invoice_number: str
+    contact_id: str
+    contact_name: str
+    amount: float
+    due_date: str
+    days_overdue: int
+    bucket: str  # 0-30, 31-60, 61-90, 90+
+
+
+class EscalationDraft(BaseModel):
+    """Escalation draft for overdue invoice."""
+    invoice_id: str
+    invoice_number: str
+    contact_name: str
+    amount: float
+    days_overdue: int
+    escalation_level: int  # 1=friendly, 2=formal, 3=firm, 4=legal
+    recommended_action: str
+    email_draft: Optional[str] = None
+
+
+class Anomaly(BaseModel):
+    """Detected accounting anomaly."""
+    anomaly_type: str  # duplicate_number, unusual_amount, same_day_duplicate
+    severity: str  # low, medium, high
+    document_id: str
+    document_number: str
+    description: str
+    details: Dict[str, Any] = {}
+
+
+# Spanish PGC expense account classification hints
+EXPENSE_ACCOUNT_HINTS = {
+    # 62xx - Servicios exteriores
+    "6200": {"name": "Arrendamientos y cánones", "keywords": ["alquiler", "renting", "leasing", "arrendamiento", "canon"]},
+    "6210": {"name": "Reparaciones y conservación", "keywords": ["reparación", "reparacion", "mantenimiento", "taller", "mecánico", "mecanico"]},
+    "6220": {"name": "Servicios profesionales independientes", "keywords": ["abogado", "asesor", "consultor", "notario", "gestor", "auditor"]},
+    "6230": {"name": "Transportes", "keywords": ["transporte", "envío", "envio", "flete", "logística", "logistica", "mensajería", "paquetería"]},
+    "6240": {"name": "Primas de seguros", "keywords": ["seguro", "póliza", "poliza", "aseguradora"]},
+    "6250": {"name": "Servicios bancarios", "keywords": ["comisión bancaria", "comision bancaria", "transferencia", "swift", "sepa"]},
+    "6260": {"name": "Publicidad y propaganda", "keywords": ["publicidad", "marketing", "anuncio", "promoción", "promocion", "google ads", "facebook"]},
+    "6270": {"name": "Suministros", "keywords": ["luz", "agua", "gas", "electricidad", "teléfono", "telefono", "internet", "móvil", "movil"]},
+    "6280": {"name": "Combustibles", "keywords": ["gasolina", "gasóleo", "gasoleo", "diesel", "combustible", "carburante", "repostaje"]},
+    "6290": {"name": "Otros servicios", "keywords": ["limpieza", "vigilancia", "seguridad", "suscripción", "suscripcion", "software", "hosting"]},
+    # 63xx - Tributos
+    "6300": {"name": "Impuesto sobre beneficios", "keywords": ["impuesto sociedades", "is"]},
+    "6310": {"name": "Otros tributos", "keywords": ["tasa", "arbitrio", "iae", "ibi", "ivtm"]},
+    # 64xx - Gastos de personal
+    "6400": {"name": "Sueldos y salarios", "keywords": ["nómina", "nomina", "salario", "sueldo"]},
+    "6420": {"name": "Seguridad Social", "keywords": ["seguridad social", "ss", "cotización", "cotizacion"]},
+    # 65xx - Otros gastos de gestión
+    "6590": {"name": "Otros gastos de gestión corriente", "keywords": ["multa", "sanción", "sancion", "recargo"]},
+    # 66xx - Gastos financieros
+    "6620": {"name": "Intereses de deudas", "keywords": ["interés", "interes", "financiación", "financiacion", "préstamo", "prestamo"]},
+    "6690": {"name": "Otros gastos financieros", "keywords": ["comisión financiera", "comision financiera", "descuento pronto pago"]},
+}
+
+
+def classify_expense(description: str, supplier_name: str = "") -> ExpenseClassification:
+    """Classify expense to PGC account code based on description and supplier."""
+    description_lower = description.lower()
+    supplier_lower = supplier_name.lower() if supplier_name else ""
+
+    best_match = None
+    best_score = 0
+    alternatives = []
+
+    for code, hints in EXPENSE_ACCOUNT_HINTS.items():
+        score = 0
+        for keyword in hints["keywords"]:
+            if keyword in description_lower:
+                score += 2
+            if keyword in supplier_lower:
+                score += 1
+
+        if score > 0:
+            if score > best_score:
+                if best_match:
+                    alternatives.append(best_match[0])
+                best_match = (code, hints["name"], score)
+                best_score = score
+            elif score == best_score and best_match:
+                alternatives.append(code)
+
+    if best_match:
+        confidence = min(0.95, 0.5 + (best_score * 0.1))
+        return ExpenseClassification(
+            account_code=best_match[0],
+            account_name=best_match[1],
+            confidence=confidence,
+            method="keyword",
+            alternative_codes=alternatives[:3]
+        )
+
+    # Default to "Otros servicios"
+    return ExpenseClassification(
+        account_code="6290",
+        account_name="Otros servicios",
+        confidence=0.3,
+        method="default",
+        alternative_codes=["6230", "6280"]
+    )
+
+
 # ============================================================================
 # HEALTH
 # ============================================================================
@@ -1710,6 +1843,562 @@ async def get_account_ledger(
         }
     except Exception as e:
         logger.error(f"Error getting account ledger: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# CONTABLE AGENT (Phase 5)
+# ============================================================================
+
+@app.get("/api/v1/contable/dashboard")
+@cached(ttl=300, prefix="contable:dashboard")
+async def get_contable_dashboard(
+    request: Request,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get comprehensive accounting dashboard for Contable agent.
+
+    Returns summary of financial position, pending documents, overdue invoices,
+    reconciliation status, and alerts requiring attention.
+    """
+    try:
+        from holded.accounting_reports import AccountingReporter
+
+        reporter = AccountingReporter(client)
+
+        # Get trial balance summary
+        trial_balance = reporter.trial_balance()
+
+        # Get pending invoices (unpaid)
+        pending_invoices = client.list_documents("invoice", limit=100)
+        pending_count = len([d for d in pending_invoices if not d.get("paid")])
+        pending_amount = sum(
+            float(d.get("total", 0))
+            for d in pending_invoices
+            if not d.get("paid")
+        )
+
+        # Get pending purchases (unpaid)
+        pending_purchases = client.list_documents("purchase", limit=100)
+        pending_purchase_count = len([d for d in pending_purchases if not d.get("paid")])
+        pending_purchase_amount = sum(
+            float(d.get("total", 0))
+            for d in pending_purchases
+            if not d.get("paid")
+        )
+
+        # Get overdue invoices
+        now = int(datetime.now().timestamp())
+        overdue = [
+            d for d in pending_invoices
+            if not d.get("paid") and d.get("dueDate", now) < now
+        ]
+        overdue_amount = sum(float(d.get("total", 0)) for d in overdue)
+
+        # Count by overdue buckets
+        buckets = {"0-30": 0, "31-60": 0, "61-90": 0, "90+": 0}
+        for doc in overdue:
+            due_date = doc.get("dueDate", now)
+            days = (now - due_date) // 86400
+            if days <= 30:
+                buckets["0-30"] += 1
+            elif days <= 60:
+                buckets["31-60"] += 1
+            elif days <= 90:
+                buckets["61-90"] += 1
+            else:
+                buckets["90+"] += 1
+
+        return {
+            "summary": {
+                "trial_balance_status": "balanced" if trial_balance["is_balanced"] else "unbalanced",
+                "total_debits": trial_balance["totals"]["debit"],
+                "total_credits": trial_balance["totals"]["credit"],
+            },
+            "receivables": {
+                "pending_invoices": pending_count,
+                "pending_amount": round(pending_amount, 2),
+                "overdue_count": len(overdue),
+                "overdue_amount": round(overdue_amount, 2),
+                "overdue_buckets": buckets,
+            },
+            "payables": {
+                "pending_purchases": pending_purchase_count,
+                "pending_amount": round(pending_purchase_amount, 2),
+            },
+            "alerts": {
+                "legal_escalation_needed": buckets["90+"],
+                "trial_balance_issue": not trial_balance["is_balanced"],
+            },
+            "updated_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Error getting contable dashboard: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/reports/income-statement")
+@cached(ttl=600, prefix="contable:income-statement")
+async def get_income_statement(
+    request: Request,
+    date_from: str = Query(..., description="Start date (YYYY-MM-DD)"),
+    date_to: str = Query(..., description="End date (YYYY-MM-DD)"),
+    client: HoldedClient = Depends(get_client)
+):
+    """Get income statement (P&L) for a period.
+
+    Returns revenue, expenses, and net income using the AccountingReporter.
+    """
+    try:
+        from holded.accounting_reports import AccountingReporter
+
+        from_dt = datetime.strptime(date_from, "%Y-%m-%d")
+        to_dt = datetime.strptime(date_to, "%Y-%m-%d")
+
+        if from_dt > to_dt:
+            raise HTTPException(status_code=400, detail="date_from must be before date_to")
+
+        reporter = AccountingReporter(client)
+        return reporter.income_statement(from_dt, to_dt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {e}. Use YYYY-MM-DD")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting income statement: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/reports/balance-sheet")
+@cached(ttl=600, prefix="contable:balance-sheet")
+async def get_balance_sheet(
+    request: Request,
+    as_of_date: str = Query(..., description="As-of date (YYYY-MM-DD)"),
+    client: HoldedClient = Depends(get_client)
+):
+    """Get balance sheet as of a specific date."""
+    try:
+        from holded.accounting_reports import AccountingReporter
+
+        date = datetime.strptime(as_of_date, "%Y-%m-%d")
+        reporter = AccountingReporter(client)
+        return reporter.balance_sheet(date)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {e}. Use YYYY-MM-DD")
+    except Exception as e:
+        logger.error(f"Error getting balance sheet: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/contable/classify")
+async def classify_expense_endpoint(
+    description: str = Query(..., description="Expense description"),
+    supplier: str = Query("", description="Supplier name (optional)"),
+):
+    """Classify an expense to a chart of accounts code.
+
+    Uses keyword matching against Spanish PGC (Plan General Contable).
+    Returns account code, name, confidence, and classification method.
+    """
+    result = classify_expense(description, supplier)
+    return {
+        "account_code": result.account_code,
+        "account_name": result.account_name,
+        "confidence": result.confidence,
+        "method": result.method,
+        "alternative_codes": result.alternative_codes,
+    }
+
+
+@app.get("/api/v1/contable/classify")
+async def classify_expense_get(
+    description: str = Query(..., description="Expense description"),
+    supplier: str = Query("", description="Supplier name (optional)"),
+):
+    """GET version of expense classification for simple queries."""
+    result = classify_expense(description, supplier)
+    return {
+        "account_code": result.account_code,
+        "account_name": result.account_name,
+        "confidence": result.confidence,
+        "method": result.method,
+        "alternative_codes": result.alternative_codes,
+    }
+
+
+@app.get("/api/v1/contable/overdue")
+@cached(ttl=300, prefix="contable:overdue")
+async def get_overdue_invoices(
+    request: Request,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get overdue invoices categorized by age bucket.
+
+    Buckets: 0-30 days, 31-60 days, 61-90 days, 90+ days.
+    Includes recommended actions for each bucket.
+    """
+    try:
+        invoices = client.list_documents("invoice", limit=500)
+        now = int(datetime.now().timestamp())
+
+        buckets = {
+            "0-30": {"count": 0, "amount": 0, "items": [], "action": "Monitor"},
+            "31-60": {"count": 0, "amount": 0, "items": [], "action": "Friendly reminder"},
+            "61-90": {"count": 0, "amount": 0, "items": [], "action": "Formal notice (Ley 3/2004)"},
+            "90+": {"count": 0, "amount": 0, "items": [], "action": "Legal escalation"},
+        }
+
+        total_overdue = 0
+
+        for doc in invoices:
+            if doc.get("paid"):
+                continue
+
+            due_date = doc.get("dueDate", now)
+            if due_date >= now:
+                continue  # Not overdue
+
+            days_overdue = (now - due_date) // 86400
+            amount = float(doc.get("total", 0))
+            total_overdue += amount
+
+            item = {
+                "id": doc.get("id"),
+                "number": doc.get("docNumber"),
+                "contact_id": doc.get("contactId"),
+                "contact_name": doc.get("contactName", ""),
+                "amount": round(amount, 2),
+                "due_date": datetime.fromtimestamp(due_date).strftime("%Y-%m-%d"),
+                "days_overdue": days_overdue,
+            }
+
+            if days_overdue <= 30:
+                buckets["0-30"]["count"] += 1
+                buckets["0-30"]["amount"] += amount
+                buckets["0-30"]["items"].append(item)
+            elif days_overdue <= 60:
+                buckets["31-60"]["count"] += 1
+                buckets["31-60"]["amount"] += amount
+                buckets["31-60"]["items"].append(item)
+            elif days_overdue <= 90:
+                buckets["61-90"]["count"] += 1
+                buckets["61-90"]["amount"] += amount
+                buckets["61-90"]["items"].append(item)
+            else:
+                buckets["90+"]["count"] += 1
+                buckets["90+"]["amount"] += amount
+                buckets["90+"]["items"].append(item)
+
+        # Round amounts
+        for bucket in buckets.values():
+            bucket["amount"] = round(bucket["amount"], 2)
+            # Limit items returned
+            bucket["items"] = bucket["items"][:10]
+
+        return {
+            "buckets": buckets,
+            "total_overdue_amount": round(total_overdue, 2),
+            "total_overdue_count": sum(b["count"] for b in buckets.values()),
+            "action_required": {
+                "friendly_reminder": buckets["31-60"]["count"],
+                "formal_notice": buckets["61-90"]["count"],
+                "legal_escalation": buckets["90+"]["count"],
+            },
+            "updated_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Error getting overdue invoices: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/contable/overdue/{invoice_id}/escalate")
+async def create_escalation_draft(
+    invoice_id: str,
+    to_legal: bool = Query(False, description="Escalate to legal department"),
+    client: HoldedClient = Depends(get_client)
+):
+    """Create escalation draft for an overdue invoice.
+
+    Creates a draft action for human approval before execution.
+    Returns draft data with recommended action based on overdue days.
+    """
+    try:
+        # Get invoice details
+        doc = client.get_document("invoice", invoice_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        now = int(datetime.now().timestamp())
+        due_date = doc.get("dueDate", now)
+        days_overdue = max(0, (now - due_date) // 86400)
+
+        # Determine escalation level
+        if to_legal or days_overdue > 90:
+            level = 4
+            action = "legal_escalation"
+            recommended = "Crear ticket en Zoho Desk para departamento Legal"
+        elif days_overdue > 60:
+            level = 3
+            action = "formal_notice"
+            recommended = "Enviar notificación formal citando Ley 3/2004"
+        elif days_overdue > 30:
+            level = 2
+            action = "friendly_reminder"
+            recommended = "Enviar recordatorio cordial de pago"
+        else:
+            level = 1
+            action = "monitor"
+            recommended = "Monitorear - aún dentro del plazo razonable"
+
+        return {
+            "status": "draft_created",
+            "draft": {
+                "invoice_id": invoice_id,
+                "invoice_number": doc.get("docNumber"),
+                "contact_id": doc.get("contactId"),
+                "contact_name": doc.get("contactName", ""),
+                "amount": float(doc.get("total", 0)),
+                "days_overdue": days_overdue,
+                "escalation_level": level,
+                "action": action,
+                "recommended": recommended,
+            },
+            "message": f"Draft escalation created for {doc.get('docNumber')}",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating escalation draft: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/anomalies")
+@cached(ttl=600, prefix="contable:anomalies")
+async def check_anomalies(
+    request: Request,
+    client: HoldedClient = Depends(get_client)
+):
+    """Run all anomaly detection checks.
+
+    Detects:
+    - Duplicate invoice numbers
+    - Unusual amounts (>3 standard deviations)
+    - Potential duplicate purchases (same supplier+amount+day)
+
+    Returns anomalies with severity levels.
+    """
+    try:
+        import statistics
+
+        anomalies = []
+
+        # Get recent invoices and purchases
+        invoices = client.list_documents("invoice", limit=500)
+        purchases = client.list_documents("purchase", limit=500)
+
+        # Check for duplicate invoice numbers
+        invoice_numbers = {}
+        for doc in invoices:
+            num = doc.get("docNumber", "")
+            if num in invoice_numbers:
+                anomalies.append({
+                    "type": "duplicate_number",
+                    "severity": "high",
+                    "document_id": doc.get("id"),
+                    "document_number": num,
+                    "description": f"Duplicate invoice number: {num}",
+                    "details": {
+                        "original_id": invoice_numbers[num],
+                        "duplicate_id": doc.get("id"),
+                    }
+                })
+            else:
+                invoice_numbers[num] = doc.get("id")
+
+        # Check for unusual amounts in invoices
+        amounts = [float(d.get("total", 0)) for d in invoices if d.get("total")]
+        if len(amounts) > 10:
+            mean = statistics.mean(amounts)
+            stdev = statistics.stdev(amounts)
+            threshold = mean + (3 * stdev)
+
+            for doc in invoices:
+                amount = float(doc.get("total", 0))
+                if amount > threshold:
+                    anomalies.append({
+                        "type": "unusual_amount",
+                        "severity": "medium",
+                        "document_id": doc.get("id"),
+                        "document_number": doc.get("docNumber"),
+                        "description": f"Unusually high amount: €{amount:,.2f} (avg: €{mean:,.2f})",
+                        "details": {
+                            "amount": amount,
+                            "average": round(mean, 2),
+                            "threshold": round(threshold, 2),
+                        }
+                    })
+
+        # Check for same-day duplicate purchases
+        purchase_keys = {}
+        for doc in purchases:
+            supplier = doc.get("contactId", "")
+            amount = round(float(doc.get("total", 0)), 2)
+            date = doc.get("date", 0)
+            key = f"{supplier}:{amount}:{date}"
+
+            if key in purchase_keys and supplier:
+                anomalies.append({
+                    "type": "same_day_duplicate",
+                    "severity": "medium",
+                    "document_id": doc.get("id"),
+                    "document_number": doc.get("docNumber"),
+                    "description": f"Possible duplicate: same supplier, amount, and date",
+                    "details": {
+                        "supplier_id": supplier,
+                        "amount": amount,
+                        "original_id": purchase_keys[key],
+                    }
+                })
+            else:
+                purchase_keys[key] = doc.get("id")
+
+        # Count by severity
+        by_severity = {"high": 0, "medium": 0, "low": 0}
+        for a in anomalies:
+            by_severity[a["severity"]] = by_severity.get(a["severity"], 0) + 1
+
+        return {
+            "anomalies": anomalies,
+            "total_count": len(anomalies),
+            "by_severity": by_severity,
+            "by_type": {
+                "duplicate_number": len([a for a in anomalies if a["type"] == "duplicate_number"]),
+                "unusual_amount": len([a for a in anomalies if a["type"] == "unusual_amount"]),
+                "same_day_duplicate": len([a for a in anomalies if a["type"] == "same_day_duplicate"]),
+            },
+            "checked_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Error checking anomalies: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/agent/queue")
+@cached(ttl=120, prefix="contable:agent:queue")
+async def get_agent_queue(
+    request: Request,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get Contable agent's action queue.
+
+    Returns pending actions that require human approval:
+    - Overdue invoice escalations
+    - Anomaly resolutions
+    """
+    try:
+        # Get overdue summary
+        invoices = client.list_documents("invoice", limit=500)
+        now = int(datetime.now().timestamp())
+
+        overdue_90_plus = []
+        for doc in invoices:
+            if doc.get("paid"):
+                continue
+            due_date = doc.get("dueDate", now)
+            if due_date >= now:
+                continue
+            days_overdue = (now - due_date) // 86400
+            if days_overdue > 90:
+                overdue_90_plus.append({
+                    "id": doc.get("id"),
+                    "number": doc.get("docNumber"),
+                    "contact_name": doc.get("contactName", ""),
+                    "amount": float(doc.get("total", 0)),
+                    "days_overdue": days_overdue,
+                })
+
+        # Get high-severity anomalies (simplified check)
+        invoice_numbers = {}
+        high_anomalies = []
+        for doc in invoices:
+            num = doc.get("docNumber", "")
+            if num in invoice_numbers:
+                high_anomalies.append({
+                    "type": "duplicate_number",
+                    "document_number": num,
+                    "document_id": doc.get("id"),
+                })
+            else:
+                invoice_numbers[num] = doc.get("id")
+
+        return {
+            "agent": "contable",
+            "pending_approvals": {
+                "escalations_needed": len(overdue_90_plus),
+                "anomalies_high": len(high_anomalies),
+            },
+            "total_pending": len(overdue_90_plus) + len(high_anomalies),
+            "items": {
+                "overdue_90_plus": overdue_90_plus[:10],
+                "high_anomalies": high_anomalies[:10],
+            },
+            "updated_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Error getting agent queue: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/contable/summary")
+@cached(ttl=300, prefix="contable:summary")
+async def get_daily_summary(
+    request: Request,
+    client: HoldedClient = Depends(get_client)
+):
+    """Get daily accounting summary for Secretary dashboard.
+
+    Optimized for inclusion in the Secretary Eisenhower matrix.
+    """
+    try:
+        invoices = client.list_documents("invoice", limit=200)
+        purchases = client.list_documents("purchase", limit=200)
+        now = int(datetime.now().timestamp())
+
+        # Pending invoices
+        pending_invoices = [d for d in invoices if not d.get("paid")]
+        pending_amount = sum(float(d.get("total", 0)) for d in pending_invoices)
+
+        # Overdue
+        overdue = [d for d in pending_invoices if d.get("dueDate", now) < now]
+        overdue_amount = sum(float(d.get("total", 0)) for d in overdue)
+        overdue_90_plus = len([
+            d for d in overdue
+            if (now - d.get("dueDate", now)) // 86400 > 90
+        ])
+
+        # Pending purchases
+        pending_purchases = [d for d in purchases if not d.get("paid")]
+        payables_amount = sum(float(d.get("total", 0)) for d in pending_purchases)
+
+        return {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "receivables": {
+                "pending_count": len(pending_invoices),
+                "pending_amount": round(pending_amount, 2),
+                "overdue_count": len(overdue),
+                "overdue_amount": round(overdue_amount, 2),
+            },
+            "payables": {
+                "pending_count": len(pending_purchases),
+                "pending_amount": round(payables_amount, 2),
+            },
+            "alerts": {
+                "legal_escalation_needed": overdue_90_plus,
+            },
+            "cash_position": round(pending_amount - payables_amount, 2),
+        }
+    except Exception as e:
+        logger.error(f"Error getting daily summary: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
