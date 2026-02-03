@@ -24,13 +24,19 @@ from pydantic import BaseModel, Field
 # Supports both local development (claude-tools) and production (bundled)
 LIB_PATHS = [
     Path(__file__).parent / "lib",  # Bundled in repo
+    Path("/app/lib"),  # Docker container
     Path.home() / "Desarrollos/claude-tools/lib",  # Local development
 ]
 
+lib_loaded = False
 for lib_path in LIB_PATHS:
     if lib_path.exists() and str(lib_path) not in sys.path:
         sys.path.insert(0, str(lib_path))
+        lib_loaded = True
         break
+
+if not lib_loaded:
+    raise RuntimeError(f"Could not find holded library in any of: {LIB_PATHS}")
 
 from holded.holded_client import HoldedClient, DocumentBuilder
 
