@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -40,7 +40,17 @@ for lib_path in LIB_PATHS:
 if not lib_loaded:
     raise RuntimeError(f"Could not find holded library in any of: {LIB_PATHS}")
 
+# Add app directory to path
+sys.path.insert(0, str(Path(__file__).parent))
+
 from holded.holded_client import HoldedClient, DocumentBuilder
+
+# Import app modules
+from app.config import get_settings, Settings
+from app.cache.redis_client import RedisClient, set_redis_client, get_redis_client
+from app.cache.decorators import cached, invalidate_cache
+from app.db.database import DatabaseManager, set_db_manager, get_db_manager
+from app.middleware.audit import AuditMiddleware
 
 # Configure logging
 logging.basicConfig(
@@ -57,26 +67,61 @@ def get_client() -> HoldedClient:
     """Get or create HoldedClient instance."""
     global _client
     if _client is None:
-        api_key = os.getenv("HOLDED_API_KEY")
-        if api_key:
-            _client = HoldedClient(api_key)
+        settings = get_settings()
+        if settings.holded_api_key:
+            _client = HoldedClient(settings.holded_api_key)
         else:
-            _client = HoldedClient.from_credentials()
+            api_key = os.getenv("HOLDED_API_KEY")
+            if api_key:
+                _client = HoldedClient(api_key)
+            else:
+                _client = HoldedClient.from_credentials()
     return _client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    settings = get_settings()
     logger.info("Holded API service starting...")
+
+    # Initialize Redis
+    redis_client = None
+    if settings.cache_enabled:
+        try:
+            redis_client = RedisClient(settings.redis_url)
+            await redis_client.connect()
+            set_redis_client(redis_client)
+            logger.info("Redis cache enabled")
+        except Exception as e:
+            logger.warning(f"Redis connection failed, caching disabled: {e}")
+
+    # Initialize Database
+    db_manager = None
+    if settings.audit_enabled:
+        try:
+            db_manager = DatabaseManager(settings.database_url)
+            await db_manager.connect()
+            set_db_manager(db_manager)
+            logger.info("Audit logging enabled")
+        except Exception as e:
+            logger.warning(f"Database connection failed, audit disabled: {e}")
+
     yield
+
+    # Cleanup
+    if redis_client:
+        await redis_client.close()
+    if db_manager:
+        await db_manager.close()
+
     logger.info("Holded API service shutting down...")
 
 
 app = FastAPI(
     title="Holded API Service",
     description="Internal microservice for Holded ERP operations",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -87,6 +132,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Audit middleware (added after CORS)
+settings = get_settings()
+app.add_middleware(AuditMiddleware, enabled=settings.audit_enabled)
 
 
 # ============================================================================
@@ -150,8 +199,35 @@ class InvoiceLookupRequest(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "holded-api"}
+    """Health check endpoint with service status."""
+    settings = get_settings()
+    status = {
+        "status": "healthy",
+        "service": "holded-api",
+        "version": "1.1.0",
+    }
+
+    # Check Redis
+    redis = get_redis_client()
+    if redis:
+        status["redis"] = await redis.health_check()
+    else:
+        status["redis"] = {"status": "disabled"}
+
+    # Check Database
+    db = get_db_manager()
+    if db:
+        status["database"] = await db.health_check()
+    else:
+        status["database"] = {"status": "disabled"}
+
+    # Check cache/audit feature flags
+    status["features"] = {
+        "cache_enabled": settings.cache_enabled and redis is not None,
+        "audit_enabled": settings.audit_enabled and db is not None,
+    }
+
+    return status
 
 
 # ============================================================================
@@ -159,7 +235,9 @@ async def health_check():
 # ============================================================================
 
 @app.get("/api/v1/contacts")
+@cached(ttl=300, prefix="contacts:list")
 async def list_contacts(
+    request: Request,
     limit: int = Query(50, le=500),
     client: HoldedClient = Depends(get_client)
 ):
@@ -173,7 +251,9 @@ async def list_contacts(
 
 
 @app.get("/api/v1/contacts/{contact_id}")
+@cached(ttl=600, prefix="contacts:id")
 async def get_contact(
+    request: Request,
     contact_id: str,
     client: HoldedClient = Depends(get_client)
 ):
@@ -187,7 +267,9 @@ async def get_contact(
 
 
 @app.get("/api/v1/contacts/search/{query}")
+@cached(ttl=300, prefix="contacts:search")
 async def search_contacts(
+    request: Request,
     query: str,
     client: HoldedClient = Depends(get_client)
 ):
@@ -231,6 +313,10 @@ async def create_contact(
             contact_data["billAddress"] = {"address": data.address}
 
         result = client.create_contact(contact_data)
+
+        # Invalidate contacts cache
+        await invalidate_cache("holded:contacts:*")
+
         return {"success": True, "contact_id": result.get("id"), "contact": result}
     except Exception as e:
         logger.error(f"Error creating contact: {e}")
@@ -242,7 +328,9 @@ async def create_contact(
 # ============================================================================
 
 @app.get("/api/v1/documents/invoices")
+@cached(ttl=900, prefix="docs:invoices")
 async def list_invoices(
+    request: Request,
     limit: int = Query(50, le=500),
     contact_id: Optional[str] = None,
     year: Optional[int] = Query(None, description="Filter by year (e.g., 2024)"),
@@ -271,7 +359,9 @@ async def list_invoices(
 
 
 @app.get("/api/v1/documents/estimates")
+@cached(ttl=900, prefix="docs:estimates")
 async def list_estimates(
+    request: Request,
     limit: int = Query(50, le=500),
     contact_id: Optional[str] = None,
     year: Optional[int] = Query(None, description="Filter by year (e.g., 2024)"),
@@ -300,7 +390,9 @@ async def list_estimates(
 
 
 @app.get("/api/v1/documents/{doc_type}/year/{year}")
+@cached(ttl=900, prefix="docs:year")
 async def list_documents_by_year(
+    request: Request,
     doc_type: str,
     year: int,
     limit: int = Query(500, le=1000),
@@ -324,7 +416,9 @@ async def list_documents_by_year(
 
 
 @app.get("/api/v1/documents/{doc_type}/{document_id}")
+@cached(ttl=600, prefix="docs:single")
 async def get_document(
+    request: Request,
     doc_type: str,
     document_id: str,
     client: HoldedClient = Depends(get_client)
@@ -408,6 +502,9 @@ async def create_shipping_estimate(
             except Exception as e:
                 logger.warning(f"Failed to send estimate: {e}")
 
+        # 5. Invalidate estimates cache
+        await invalidate_cache("holded:docs:estimates:*")
+
         return {
             "success": True,
             "estimate_id": estimate_id,
@@ -462,6 +559,9 @@ async def create_estimate(
                 sent = True
             except Exception as e:
                 logger.warning(f"Failed to send estimate: {e}")
+
+        # Invalidate estimates cache
+        await invalidate_cache("holded:docs:estimates:*")
 
         return {
             "success": True,
@@ -561,7 +661,9 @@ async def check_outstanding_debt(
 # ============================================================================
 
 @app.post("/api/v1/invoices/lookup")
+@cached(ttl=1800, prefix="lookup:invoice")
 async def lookup_invoice(
+    request: Request,
     data: InvoiceLookupRequest,
     year: Optional[int] = Query(None, description="Limit search to specific year"),
     client: HoldedClient = Depends(get_client)
@@ -623,7 +725,9 @@ async def lookup_invoice(
 
 
 @app.get("/api/v1/invoices/{invoice_number}")
+@cached(ttl=1800, prefix="lookup:invoice:get")
 async def get_invoice_by_number(
+    request: Request,
     invoice_number: str,
     year: Optional[int] = Query(None, description="Limit search to specific year"),
     client: HoldedClient = Depends(get_client)
@@ -634,7 +738,7 @@ async def get_invoice_by_number(
     class Req(BM):
         invoice_number: str
 
-    return await lookup_invoice(Req(invoice_number=invoice_number), year, client)
+    return await lookup_invoice(request, Req(invoice_number=invoice_number), year, client)
 
 
 # ============================================================================
@@ -668,6 +772,10 @@ async def _find_or_create_contact(
         contact_data["email"] = email
 
     result = client.create_contact(contact_data)
+
+    # Invalidate contacts cache since we created a new one
+    await invalidate_cache("holded:contacts:*")
+
     return result.get("id")
 
 
