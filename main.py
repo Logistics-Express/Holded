@@ -28,21 +28,12 @@ LIB_PATHS = [
     Path.home() / "Desarrollos/claude-tools/lib",  # Local development
 ]
 
-# Debug: Print directory contents at startup
-print(f"DEBUG: __file__ = {__file__}")
-print(f"DEBUG: parent = {Path(__file__).parent}")
-print(f"DEBUG: /app contents = {list(Path('/app').iterdir()) if Path('/app').exists() else 'NOT FOUND'}")
-print(f"DEBUG: /app/lib exists = {Path('/app/lib').exists()}")
-if Path('/app/lib').exists():
-    print(f"DEBUG: /app/lib contents = {list(Path('/app/lib').iterdir())}")
-
 lib_loaded = False
 for lib_path in LIB_PATHS:
-    print(f"DEBUG: Checking {lib_path}, exists={lib_path.exists()}")
-    if lib_path.exists() and str(lib_path) not in sys.path:
-        sys.path.insert(0, str(lib_path))
+    if lib_path.exists():
+        if str(lib_path) not in sys.path:
+            sys.path.insert(0, str(lib_path))
         lib_loaded = True
-        print(f"DEBUG: Loaded lib from {lib_path}")
         break
 
 if not lib_loaded:
