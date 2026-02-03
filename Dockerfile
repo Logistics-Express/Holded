@@ -6,19 +6,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
-COPY . .
-
-# Copy holded client from claude-tools
-# Note: In production, this should be a proper package or copied at build time
-RUN mkdir -p /app/lib
-COPY lib/ /app/lib/
+# Copy application and lib
+COPY main.py .
+COPY lib/ lib/
 
 # Set Python path to include lib
 ENV PYTHONPATH=/app:/app/lib
 
-# Expose port
+# Expose port (Railway provides PORT env var)
 EXPOSE 8001
 
-# Run
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+# Run with PORT from environment
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001}
