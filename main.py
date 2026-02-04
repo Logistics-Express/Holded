@@ -72,6 +72,13 @@ from app.db.models import (
     ContableDailySnapshot,
 )
 from app.qonto.client import QontoClient, QontoTransaction
+from app.api_core_client import (
+    publish_payment_reconciled_event,
+    publish_invoice_paid_event,
+    publish_invoice_created_event,
+    publish_estimate_accepted_event,
+    close_client as close_api_core_client,
+)
 
 # OpenAI for Contable AI Agent
 try:
@@ -1729,6 +1736,14 @@ async def pay_document(
 
         # Invalidate document cache
         await invalidate_cache(f"holded:docs:{doc_type}:*")
+
+        # Publish event to api-core
+        await publish_invoice_paid_event(
+            document_id=document_id,
+            document_type=doc_type,
+            amount=data.amount,
+            payment_date=payment_data.get("date"),
+        )
 
         return {"success": True, "document_id": document_id, "result": result}
     except Exception as e:
@@ -4236,6 +4251,17 @@ async def approve_reconciliation_match(
 
             # Invalidate cache
             await invalidate_cache(f"holded:docs:{match.holded_document_type}:*")
+
+            # Publish event to api-core
+            await publish_payment_reconciled_event(
+                document_id=match.holded_document_id,
+                document_number=match.holded_document_number,
+                document_type=match.holded_document_type,
+                amount=float(match.qonto_amount),
+                qonto_transaction_id=match.qonto_transaction_id,
+                contact_name=getattr(match, "contact_name", None),
+                contact_id=getattr(match, "holded_contact_id", None),
+            )
 
             return {
                 "success": True,

@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     snapshot_job_hour: int = 23  # Hour to run daily snapshot
     anomaly_check_job_hour: int = 9  # Hour to run anomaly detection
 
+    # API Core (Unified Backend)
+    api_core_url: str = "https://api-core-production-0f71.up.railway.app"
+    api_core_api_key: str = ""  # Service-to-service auth
+    api_core_enabled: bool = True  # Publish events to api-core
+
     # Qonto API (for reconciliation)
     # Company: LOGISTICS EXPRESS ADUANAS, S.L.U.
     qonto_login: str = "logistics-express-aduanas-sociedad-limitada-3984"
