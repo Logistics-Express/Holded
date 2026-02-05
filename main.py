@@ -70,6 +70,7 @@ from app.db.models import (
     ContableActionQueue,
     ContableReconciliationMatch,
     ContableDailySnapshot,
+    StripeReconciliationMatch,
 )
 from app.qonto.client import QontoClient, QontoTransaction
 from app.api_core_client import (
@@ -4335,6 +4336,549 @@ async def reject_reconciliation_match(
     except Exception as e:
         logger.error(f"Error rejecting match: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# STRIPE RECONCILIATION ENDPOINTS
+# ============================================================================
+
+class StripeReconcileRequest(BaseModel):
+    """Request to record a Stripe payment for reconciliation."""
+    payment_intent_id: str = Field(..., description="Stripe PaymentIntent ID")
+    amount_cents: int = Field(..., description="Payment amount in cents")
+    currency: str = Field(default="EUR", description="Currency code")
+    holded_invoice_id: Optional[str] = Field(None, description="Holded invoice ID if known")
+    holded_document_type: str = Field(default="invoice", description="Document type")
+    customer_email: Optional[str] = Field(None, description="Customer email")
+    payment_type: Optional[str] = Field(None, description="Payment type (presupuesto, invoice, deposit, custom)")
+    presupuesto_id: Optional[str] = Field(None, description="Presupuesto ID if applicable")
+    deposit_percent: Optional[int] = Field(None, description="Deposit percentage if applicable")
+    checkout_session_id: Optional[str] = Field(None, description="Stripe Checkout session ID")
+    source: str = Field(default="api", description="Source of the reconciliation request")
+
+
+def _validate_document_id(doc_id: Optional[str]) -> bool:
+    """Validate Holded document ID format (24 char hex)."""
+    if not doc_id:
+        return True  # None is valid (optional field)
+    import re
+    return bool(re.match(r'^[a-f0-9]{24}$', doc_id, re.IGNORECASE))
+
+
+def _validate_currency(currency: str) -> str:
+    """Validate and normalize currency code (ISO 4217)."""
+    valid_currencies = {"EUR", "USD", "GBP"}
+    normalized = currency.upper().strip() if currency else "EUR"
+    return normalized if normalized in valid_currencies else "EUR"
+
+
+def _sanitize_error_message(error: str) -> str:
+    """Sanitize error message to prevent information disclosure."""
+    # Don't expose internal details
+    if any(keyword in error.lower() for keyword in ["password", "key", "secret", "token", "sql", "database"]):
+        return "Internal error"
+    # Limit length and remove potential injection characters
+    return error[:200].replace("<", "").replace(">", "")
+
+
+@app.post("/api/v1/stripe/reconcile")
+async def receive_stripe_payment(
+    request: StripeReconcileRequest,
+    auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """
+    Receive a Stripe payment event for reconciliation.
+
+    This endpoint is called by app-logistics-express webhook handler
+    when a Stripe payment is completed.
+
+    Requires X-Service-API-Key and X-Service-Name headers.
+    """
+    service_name, _ = auth
+    logger.info(f"Stripe reconcile request from service: {service_name}")
+
+    # Validate input
+    if not request.payment_intent_id or not request.payment_intent_id.startswith('pi_'):
+        raise HTTPException(status_code=400, detail="Invalid payment_intent_id format")
+
+    if request.amount_cents <= 0 or request.amount_cents > 5000000:  # Max 50,000 EUR
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    if request.holded_invoice_id and not _validate_document_id(request.holded_invoice_id):
+        raise HTTPException(status_code=400, detail="Invalid holded_invoice_id format")
+
+    # Validate and normalize currency
+    request.currency = _validate_currency(request.currency)
+
+    settings = get_settings()
+    if not settings.stripe_reconciliation_enabled:
+        return {"success": False, "error": "Stripe reconciliation is disabled"}
+
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            # Check if payment already exists (idempotency)
+            existing = await session.execute(
+                select(StripeReconciliationMatch).where(
+                    StripeReconciliationMatch.stripe_payment_intent_id == request.payment_intent_id
+                )
+            )
+            existing_match = existing.scalar_one_or_none()
+
+            if existing_match:
+                logger.info(f"Stripe payment {request.payment_intent_id} already recorded")
+                return {
+                    "success": True,
+                    "already_exists": True,
+                    "match_id": str(existing_match.id),
+                    "status": existing_match.reconciliation_status,
+                }
+
+            # Create new reconciliation record
+            amount_eur = Decimal(request.amount_cents) / 100
+            match = StripeReconciliationMatch(
+                stripe_payment_intent_id=request.payment_intent_id,
+                stripe_checkout_session_id=request.checkout_session_id,
+                stripe_amount_cents=request.amount_cents,
+                stripe_currency=request.currency.upper(),
+                stripe_customer_email=request.customer_email,
+                stripe_paid_at=datetime.utcnow(),
+                paid_amount=amount_eur,
+                holded_document_id=request.holded_invoice_id,
+                holded_document_type=request.holded_document_type,
+                payment_type=request.payment_type,
+                presupuesto_id=request.presupuesto_id,
+                deposit_percent=request.deposit_percent,
+                reconciliation_status="pending" if not request.holded_invoice_id else "matched",
+                processed_by=request.source,
+            )
+
+            session.add(match)
+            await session.commit()
+            await session.refresh(match)
+
+            logger.info(f"Recorded Stripe payment {request.payment_intent_id} for reconciliation")
+
+            # If we have a Holded invoice ID, try to record the payment in Holded
+            if request.holded_invoice_id:
+                try:
+                    await _record_stripe_payment_in_holded(
+                        invoice_id=request.holded_invoice_id,
+                        amount=float(amount_eur),
+                        payment_intent_id=request.payment_intent_id,
+                    )
+                    match.reconciliation_status = "fully_paid"
+                    await session.commit()
+                except Exception as e:
+                    logger.error(f"Failed to record payment in Holded: {e}")
+                    match.error_message = str(e)
+                    await session.commit()
+
+            return {
+                "success": True,
+                "match_id": str(match.id),
+                "status": match.reconciliation_status,
+                "amount_eur": float(amount_eur),
+            }
+
+    except Exception as e:
+        logger.error(f"Error recording Stripe payment: {e}")
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(str(e)))
+
+
+async def _record_stripe_payment_in_holded(
+    invoice_id: str,
+    amount: float,
+    payment_intent_id: str,
+) -> bool:
+    """Record a Stripe payment in Holded."""
+    settings = get_settings()
+    treasury_id = settings.holded_stripe_treasury_id or settings.holded_treasury_id
+
+    if not treasury_id:
+        logger.warning("No Stripe treasury ID configured, skipping Holded payment recording")
+        return False
+
+    try:
+        client = get_client()
+        client.pay_document(
+            doc_type="invoice",
+            document_id=invoice_id,
+            amount=amount,
+            treasury_id=treasury_id,
+            description=f"Stripe PI {payment_intent_id}",
+            paid_at=datetime.utcnow(),
+        )
+        logger.info(f"Recorded payment of €{amount} for invoice {invoice_id} in Holded")
+
+        # Publish event to api-core
+        await publish_invoice_paid_event(
+            invoice_id=invoice_id,
+            amount=amount,
+            payment_method="stripe",
+            payment_reference=payment_intent_id,
+        )
+
+        return True
+    except Exception as e:
+        logger.error(f"Failed to record payment in Holded: {e}")
+        raise
+
+
+@app.get("/api/v1/stripe/reconciliation/pending")
+async def list_pending_stripe_reconciliations(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """
+    List pending Stripe reconciliation matches.
+
+    Returns payments that need manual matching to Holded documents.
+
+    Requires X-Service-API-Key and X-Service-Name headers.
+    """
+    service_name, _ = auth
+    logger.info(f"List pending reconciliations request from service: {service_name}")
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select, func
+
+            # Count total pending
+            count_result = await session.execute(
+                select(func.count(StripeReconciliationMatch.id)).where(
+                    StripeReconciliationMatch.reconciliation_status == "pending"
+                )
+            )
+            total = count_result.scalar()
+
+            # Fetch pending matches
+            result = await session.execute(
+                select(StripeReconciliationMatch)
+                .where(StripeReconciliationMatch.reconciliation_status == "pending")
+                .order_by(StripeReconciliationMatch.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            matches = result.scalars().all()
+
+            return {
+                "success": True,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "matches": [
+                    {
+                        "id": str(m.id),
+                        "payment_intent_id": m.stripe_payment_intent_id,
+                        "amount_cents": m.stripe_amount_cents,
+                        "amount_eur": float(m.paid_amount) if m.paid_amount else m.stripe_amount_cents / 100,
+                        "currency": m.stripe_currency,
+                        "customer_email": m.stripe_customer_email,
+                        "payment_type": m.payment_type,
+                        "presupuesto_id": m.presupuesto_id,
+                        "holded_document_id": m.holded_document_id,
+                        "status": m.reconciliation_status,
+                        "created_at": m.created_at.isoformat() if m.created_at else None,
+                        "paid_at": m.stripe_paid_at.isoformat() if m.stripe_paid_at else None,
+                    }
+                    for m in matches
+                ],
+            }
+
+    except Exception as e:
+        logger.error(f"Error listing pending reconciliations: {e}")
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(str(e)))
+
+
+class ApproveStripeReconciliationRequest(BaseModel):
+    """Request to approve a Stripe reconciliation match."""
+    holded_document_id: str = Field(..., description="Holded document ID to match")
+    holded_document_type: str = Field(default="invoice", description="Document type")
+
+
+@app.post("/api/v1/stripe/reconciliation/{match_id}/approve")
+async def approve_stripe_reconciliation(
+    match_id: str,
+    request: ApproveStripeReconciliationRequest,
+    auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """
+    Approve a pending Stripe reconciliation match.
+
+    Links the Stripe payment to a Holded document and records the payment.
+
+    Requires X-Service-API-Key and X-Service-Name headers.
+    """
+    service_name, _ = auth
+    logger.info(f"Approve reconciliation request from service: {service_name}")
+
+    # Validate match_id format (UUID)
+    try:
+        uuid.UUID(match_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid match_id format")
+
+    # Validate holded_document_id format
+    if not _validate_document_id(request.holded_document_id):
+        raise HTTPException(status_code=400, detail="Invalid holded_document_id format")
+
+    # Validate document type
+    allowed_doc_types = {"invoice", "estimate", "proform", "salesreceipt", "creditnote"}
+    if request.holded_document_type not in allowed_doc_types:
+        raise HTTPException(status_code=400, detail="Invalid document type")
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(StripeReconciliationMatch).where(
+                    StripeReconciliationMatch.id == uuid.UUID(match_id)
+                )
+            )
+            match = result.scalar_one_or_none()
+
+            if not match:
+                raise HTTPException(status_code=404, detail="Match not found")
+
+            if match.reconciliation_status not in ("pending", "matched"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Match cannot be approved (status: {match.reconciliation_status})"
+                )
+
+            # Update match with Holded document info
+            match.holded_document_id = request.holded_document_id
+            match.holded_document_type = request.holded_document_type
+            match.reconciliation_status = "matched"
+            match.reconciled_at = datetime.utcnow()
+
+            # Try to record payment in Holded
+            amount_eur = float(match.paid_amount) if match.paid_amount else match.stripe_amount_cents / 100
+            try:
+                await _record_stripe_payment_in_holded(
+                    invoice_id=request.holded_document_id,
+                    amount=amount_eur,
+                    payment_intent_id=match.stripe_payment_intent_id,
+                )
+                match.reconciliation_status = "fully_paid"
+            except Exception as e:
+                logger.error(f"Failed to record payment in Holded: {e}")
+                match.error_message = str(e)
+
+            await session.commit()
+
+            return {
+                "success": True,
+                "match_id": match_id,
+                "status": match.reconciliation_status,
+                "holded_document_id": request.holded_document_id,
+                "amount_eur": amount_eur,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error approving reconciliation: {e}")
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(str(e)))
+
+
+@app.get("/api/v1/stripe/reconciliation/dashboard")
+async def get_stripe_reconciliation_dashboard(
+    days: int = Query(30, ge=1, le=365),
+    auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """
+    Get Stripe reconciliation dashboard data.
+
+    Returns summary statistics for the specified period.
+
+    Requires X-Service-API-Key and X-Service-Name headers.
+    """
+    service_name, _ = auth
+    logger.info(f"Dashboard request from service: {service_name}")
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select, func
+            from datetime import timedelta
+
+            cutoff = datetime.utcnow() - timedelta(days=days)
+
+            # Get status counts
+            status_query = await session.execute(
+                select(
+                    StripeReconciliationMatch.reconciliation_status,
+                    func.count(StripeReconciliationMatch.id),
+                    func.sum(StripeReconciliationMatch.stripe_amount_cents),
+                )
+                .where(StripeReconciliationMatch.created_at >= cutoff)
+                .group_by(StripeReconciliationMatch.reconciliation_status)
+            )
+            status_results = status_query.all()
+
+            status_summary = {}
+            total_amount = 0
+            total_count = 0
+            for status, count, amount in status_results:
+                status_summary[status] = {
+                    "count": count,
+                    "amount_cents": amount or 0,
+                    "amount_eur": (amount or 0) / 100,
+                }
+                total_count += count
+                total_amount += amount or 0
+
+            # Get payment type breakdown
+            type_query = await session.execute(
+                select(
+                    StripeReconciliationMatch.payment_type,
+                    func.count(StripeReconciliationMatch.id),
+                    func.sum(StripeReconciliationMatch.stripe_amount_cents),
+                )
+                .where(StripeReconciliationMatch.created_at >= cutoff)
+                .group_by(StripeReconciliationMatch.payment_type)
+            )
+            type_results = type_query.all()
+
+            type_summary = {}
+            for ptype, count, amount in type_results:
+                type_summary[ptype or "unknown"] = {
+                    "count": count,
+                    "amount_cents": amount or 0,
+                    "amount_eur": (amount or 0) / 100,
+                }
+
+            # Get recent activity
+            recent_query = await session.execute(
+                select(StripeReconciliationMatch)
+                .order_by(StripeReconciliationMatch.created_at.desc())
+                .limit(10)
+            )
+            recent_matches = recent_query.scalars().all()
+
+            return {
+                "success": True,
+                "period_days": days,
+                "summary": {
+                    "total_payments": total_count,
+                    "total_amount_cents": total_amount,
+                    "total_amount_eur": total_amount / 100,
+                    "by_status": status_summary,
+                    "by_type": type_summary,
+                },
+                "recent_activity": [
+                    {
+                        "id": str(m.id),
+                        "payment_intent_id": m.stripe_payment_intent_id,
+                        "amount_eur": float(m.paid_amount) if m.paid_amount else m.stripe_amount_cents / 100,
+                        "status": m.reconciliation_status,
+                        "payment_type": m.payment_type,
+                        "created_at": m.created_at.isoformat() if m.created_at else None,
+                    }
+                    for m in recent_matches
+                ],
+            }
+
+    except Exception as e:
+        logger.error(f"Error getting reconciliation dashboard: {e}")
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(str(e)))
+
+
+@app.get("/api/v1/stripe/reconciliation/{match_id}")
+async def get_stripe_reconciliation(
+    match_id: str,
+    auth: Tuple[str, str] = Depends(verify_service_auth),
+):
+    """
+    Get details of a specific Stripe reconciliation match.
+
+    Requires X-Service-API-Key and X-Service-Name headers.
+    """
+    service_name, _ = auth
+    logger.info(f"Get reconciliation request from service: {service_name}")
+
+    # Validate match_id format (UUID)
+    try:
+        uuid.UUID(match_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid match_id format")
+    db_manager = get_db_manager()
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    try:
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(StripeReconciliationMatch).where(
+                    StripeReconciliationMatch.id == uuid.UUID(match_id)
+                )
+            )
+            match = result.scalar_one_or_none()
+
+            if not match:
+                raise HTTPException(status_code=404, detail="Match not found")
+
+            return {
+                "success": True,
+                "match": {
+                    "id": str(match.id),
+                    "stripe_payment_intent_id": match.stripe_payment_intent_id,
+                    "stripe_checkout_session_id": match.stripe_checkout_session_id,
+                    "stripe_amount_cents": match.stripe_amount_cents,
+                    "stripe_currency": match.stripe_currency,
+                    "stripe_customer_email": match.stripe_customer_email,
+                    "stripe_payment_method": match.stripe_payment_method,
+                    "stripe_paid_at": match.stripe_paid_at.isoformat() if match.stripe_paid_at else None,
+                    "total_document_amount": float(match.total_document_amount) if match.total_document_amount else None,
+                    "paid_amount": float(match.paid_amount) if match.paid_amount else None,
+                    "remaining_amount": float(match.remaining_amount) if match.remaining_amount else None,
+                    "payment_count": match.payment_count,
+                    "holded_document_id": match.holded_document_id,
+                    "holded_document_type": match.holded_document_type,
+                    "holded_document_number": match.holded_document_number,
+                    "holded_contact_id": match.holded_contact_id,
+                    "holded_contact_name": match.holded_contact_name,
+                    "reconciliation_status": match.reconciliation_status,
+                    "payment_type": match.payment_type,
+                    "presupuesto_id": match.presupuesto_id,
+                    "deposit_percent": match.deposit_percent,
+                    "stripe_subscription_id": match.stripe_subscription_id,
+                    "is_recurring": match.is_recurring,
+                    "subscription_period_start": match.subscription_period_start.isoformat() if match.subscription_period_start else None,
+                    "subscription_period_end": match.subscription_period_end.isoformat() if match.subscription_period_end else None,
+                    "source_webhook_event_id": match.source_webhook_event_id,
+                    "processed_by": match.processed_by,
+                    "error_message": match.error_message,
+                    "created_at": match.created_at.isoformat() if match.created_at else None,
+                    "updated_at": match.updated_at.isoformat() if match.updated_at else None,
+                    "reconciled_at": match.reconciled_at.isoformat() if match.reconciled_at else None,
+                },
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting reconciliation: {e}")
+        raise HTTPException(status_code=500, detail=_sanitize_error_message(str(e)))
 
 
 if __name__ == "__main__":
