@@ -162,6 +162,76 @@ class ContableReconciliationMatch(Base):
         return f"<ContableReconciliationMatch {self.qonto_transaction_id} -> {self.holded_document_id}>"
 
 
+class StripeReconciliationMatch(Base):
+    """Stripe payment to Holded document reconciliation.
+
+    Tracks Stripe payments and their reconciliation with Holded documents.
+    Supports partial payments (anticipos) and recurring subscriptions.
+    """
+
+    __tablename__ = "stripe_reconciliation_matches"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Stripe payment details
+    stripe_payment_intent_id = Column(String(100), unique=True, nullable=False)
+    stripe_checkout_session_id = Column(String(100), nullable=True)
+    stripe_amount_cents = Column(Integer, nullable=False)
+    stripe_currency = Column(String(3), default="EUR", nullable=False)
+    stripe_customer_email = Column(String(255), nullable=True)
+    stripe_payment_method = Column(String(50), nullable=True)  # card, bank_transfer, etc.
+    stripe_paid_at = Column(DateTime, nullable=True)
+
+    # Partial payment tracking
+    total_document_amount = Column(Numeric(12, 2), nullable=True)  # Full document amount
+    paid_amount = Column(Numeric(12, 2), default=0, nullable=False)  # Amount paid so far
+    remaining_amount = Column(Numeric(12, 2), nullable=True)  # Outstanding balance
+    payment_count = Column(Integer, default=1, nullable=False)  # Number of payments made
+
+    # Holded document link
+    holded_document_id = Column(String(50), nullable=True)
+    holded_document_type = Column(String(20), nullable=True)  # invoice, estimate, proform
+    holded_document_number = Column(String(50), nullable=True)
+    holded_contact_id = Column(String(50), nullable=True)
+    holded_contact_name = Column(String(255), nullable=True)
+
+    # Reconciliation status
+    reconciliation_status = Column(String(20), default="pending", nullable=False)
+    # pending, matched, partially_paid, fully_paid, refunded, failed
+
+    # Payment source metadata
+    payment_type = Column(String(30), nullable=True)  # presupuesto, invoice, deposit, custom
+    presupuesto_id = Column(String(50), nullable=True)  # Link to app-logistics-express
+    deposit_percent = Column(Integer, nullable=True)  # For deposit payments
+
+    # Subscription tracking
+    stripe_subscription_id = Column(String(100), nullable=True)
+    is_recurring = Column(Boolean, default=False, nullable=False)
+    subscription_period_start = Column(DateTime, nullable=True)
+    subscription_period_end = Column(DateTime, nullable=True)
+
+    # Processing metadata
+    source_webhook_event_id = Column(String(100), nullable=True)
+    processed_by = Column(String(50), nullable=True)  # webhook, manual, contable-agent
+    error_message = Column(Text, nullable=True)
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    reconciled_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_stripe_pi", "stripe_payment_intent_id", postgresql_using="btree"),
+        Index("idx_stripe_status", "reconciliation_status", postgresql_using="btree"),
+        Index("idx_stripe_holded_doc", "holded_document_id", postgresql_using="btree"),
+        Index("idx_stripe_created", "created_at", postgresql_using="btree"),
+        Index("idx_stripe_subscription", "stripe_subscription_id", postgresql_using="btree"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<StripeReconciliationMatch {self.stripe_payment_intent_id} -> {self.holded_document_id}>"
+
+
 class ContableDailySnapshot(Base):
     """Daily financial snapshots for trend analysis.
 

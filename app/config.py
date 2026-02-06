@@ -84,6 +84,21 @@ class Settings(BaseSettings):
     # Holded Treasury ID (for marking payments)
     holded_treasury_id: str = "66eaed086319523a3c03d235"
 
+    # =========================================================================
+    # STRIPE CONFIGURATION
+    # =========================================================================
+
+    # Stripe API Keys
+    stripe_secret_key: str = ""  # Set via env: STRIPE_SECRET_KEY
+    stripe_webhook_secret: str = ""  # Set via env: STRIPE_WEBHOOK_SECRET
+
+    # Stripe Treasury ID in Holded (for recording Stripe payments)
+    holded_stripe_treasury_id: str = ""  # Set via env: HOLDED_STRIPE_TREASURY_ID
+
+    # Stripe Reconciliation Settings
+    stripe_reconciliation_enabled: bool = True  # Enable Stripe reconciliation endpoints
+    stripe_auto_reconcile_threshold: float = 0.95  # Confidence threshold for auto-reconciliation
+
     class Config:
         env_file = ".env"
         extra = "ignore"
